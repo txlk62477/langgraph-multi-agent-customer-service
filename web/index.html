@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智能租房助手</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; }
+  body { background-color: #f8f9fa; color: #333; line-height: 1.6; }
+
+  .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+
+  /* ---------- 头部（科技风渐变） ---------- */
+  header {
+    text-align: center; padding: 48px 20px 36px;
+    background: linear-gradient(135deg, #6a11cb 0%, #2575fc 100%);
+    color: #fff; border-radius: 16px; margin-bottom: 30px;
+    box-shadow: 0 8px 24px rgba(37, 117, 252, .35);
+    position: relative; overflow: hidden;
+  }
+  header::before {
+    content: ""; position: absolute; inset: 0;
+    background:
+      radial-gradient(circle at 20% 30%, rgba(255,255,255,.12) 0, transparent 40%),
+      radial-gradient(circle at 80% 70%, rgba(255,255,255,.08) 0, transparent 45%);
+  }
+  header h1 { font-size: 2.4rem; font-weight: 700; position: relative; }
+  header .subtitle { font-size: 1.05rem; opacity: .92; max-width: 700px; margin: 12px auto 0; position: relative; }
+  header .badge {
+    display: inline-block; margin-top: 16px; padding: 6px 16px;
+    background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.35);
+    border-radius: 999px; font-size: .85rem; position: relative;
+  }
+
+  /* ---------- 特性卡片 ---------- */
+  .features {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 25px; margin-bottom: 40px;
+  }
+  .feature-card {
+    background: #fff; border-radius: 14px; padding: 26px 24px;
+    box-shadow: 0 4px 14px rgba(0,0,0,.06); text-align: center;
+    transition: transform .25s, box-shadow .25s;
+    border-top: 3px solid transparent;
+  }
+  .feature-card:hover { transform: translateY(-5px); box-shadow: 0 10px 26px rgba(37,117,252,.14); border-top-color: #2575fc; }
+  .feature-icon { font-size: 2.4rem; color: #2575fc; margin-bottom: 14px; }
+  .feature-title { font-size: 1.25rem; margin-bottom: 8px; color: #222; }
+  .feature-desc { color: #666; font-size: .93rem; }
+
+  /* ---------- 房源卡片 ---------- */
+  .section-title { font-size: 1.7rem; margin-bottom: 24px; color: #222; text-align: center; }
+  .houses { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 25px; margin-bottom: 40px; }
+  .house-card {
+    background: #fff; border-radius: 14px; overflow: hidden;
+    box-shadow: 0 4px 14px rgba(0,0,0,.06);
+    transition: transform .25s, box-shadow .25s;
+  }
+  .house-card:hover { transform: translateY(-5px); box-shadow: 0 12px 30px rgba(37,117,252,.16); }
+  .house-img { width: 100%; height: 205px; object-fit: cover; display: block; background: #e9ecef; }
+  .house-info { padding: 18px 20px 20px; }
+  .house-title { font-size: 1.15rem; margin-bottom: 6px; color: #222; }
+  .house-location { color: #666; font-size: .92rem; margin-bottom: 10px; }
+  .house-location i { color: #2575fc; margin-right: 5px; }
+  .house-price { color: #ff6b6b; font-size: 1.45rem; font-weight: 700; margin-bottom: 12px; }
+  .house-price small { font-size: .85rem; color: #999; font-weight: 400; }
+  .house-tags { display: flex; flex-wrap: wrap; gap: 8px; }
+  .tag { background: #e9ecef; padding: 4px 11px; border-radius: 20px; font-size: .8rem; color: #555; }
+
+  footer { text-align: center; padding: 30px 0 90px; color: #666; font-size: .88rem; border-top: 1px solid #e9ecef; }
+
+  /* ---------- 客服浮标（可拖动） ---------- */
+  #chatIcon {
+    position: fixed; bottom: 30px; right: 30px;
+    width: 60px; height: 60px; border-radius: 50%;
+    background: linear-gradient(135deg, #6a11cb, #2575fc);
+    color: #fff; font-size: 26px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: grab; z-index: 1000;
+    box-shadow: 0 6px 18px rgba(37, 117, 252, .45);
+    touch-action: none; user-select: none;
+    transition: transform .2s;
+  }
+  #chatIcon:hover { transform: scale(1.08); }
+  #chatIcon:active { cursor: grabbing; }
+
+  /* ---------- 对话窗 ---------- */
+  #chatContainer {
+    position: fixed; bottom: 104px; right: 30px;
+    width: 450px; height: 600px; max-width: calc(100vw - 40px); max-height: calc(100vh - 140px);
+    background: #fff; border-radius: 16px;
+    box-shadow: 0 16px 44px rgba(2, 6, 23, .22); z-index: 1001;
+    display: none; flex-direction: column; overflow: hidden;
+  }
+  .chat-header {
+    background: linear-gradient(135deg, #6a11cb, #2575fc);
+    color: #fff; padding: 16px 20px; font-weight: 600; font-size: 1.05rem;
+    display: flex; justify-content: space-between; align-items: center;
+    position: relative; z-index: 20; /* 让头部始终盖住会话列表面板，按钮保持可点 */
+  }
+  .chat-header .tools { display: flex; gap: 6px; }
+  .chat-header button {
+    background: none; border: none; color: #fff; font-size: 1rem;
+    cursor: pointer; padding: 4px 8px; border-radius: 8px;
+  }
+  .chat-header button:hover { background: rgba(255,255,255,.15); }
+
+  /* ---------- 历史会话面板 ---------- */
+  #sessionPanel {
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    background: #fff; z-index: 10;
+    display: none; flex-direction: column;
+  }
+  #sessionPanel.open { display: flex; }
+  .session-panel-title {
+    padding: 12px 18px; font-size: .85rem; color: #666; font-weight: 600;
+    border-bottom: 1px solid #e9ecef; background: #f8f9fa;
+  }
+  #sessionList { flex: 1; overflow-y: auto; }
+  .session-item { padding: 12px 18px; border-bottom: 1px solid #f1f3f5; cursor: pointer; }
+  .session-item:hover { background: #f0f4ff; }
+  .session-item.active { background: #e8efff; }
+  .session-id { font-weight: 600; font-size: .9rem; color: #2575fc; font-family: Consolas, monospace; word-break: break-all; }
+  .session-time { font-size: .78rem; color: #999; margin: 2px 0 4px; }
+  .session-preview {
+    font-size: .85rem; color: #555; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+
+  .chat-messages {
+    flex: 1; padding: 22px; overflow-y: auto;
+    background: #f9f9f9; display: flex; flex-direction: column; gap: 14px;
+  }
+  .message { max-width: 85%; word-wrap: break-word; }
+  .user-message {
+    background: linear-gradient(135deg, #6a11cb, #2575fc);
+    color: #fff; padding: 11px 16px;
+    border-radius: 16px 16px 0 16px; align-self: flex-end;
+    white-space: pre-wrap; font-size: .95rem;
+  }
+  .ai-message {
+    background: #fff; color: #333; padding: 12px 16px;
+    border-radius: 16px 16px 16px 0; border: 1px solid #e9ecef;
+    align-self: flex-start; font-size: .95rem;
+  }
+  .ai-message.error { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
+  /* Markdown 内容样式 */
+  .ai-message p { margin-bottom: .6em; }
+  .ai-message ul, .ai-message ol { padding-left: 20px; margin-bottom: .6em; }
+  .ai-message li { margin-bottom: .25em; }
+  .ai-message strong { font-weight: 600; }
+  .ai-message code { background: #f1f3f5; padding: 2px 5px; border-radius: 4px; font-family: Consolas, monospace; font-size: .88em; }
+  .ai-message pre { background: #f1f3f5; padding: 10px; border-radius: 8px; overflow-x: auto; margin-bottom: .6em; }
+  .ai-message pre code { background: transparent; padding: 0; }
+  .ai-message blockquote { border-left: 4px solid #2575fc; padding-left: 12px; color: #666; margin-left: 0; margin-bottom: .6em; }
+
+  .progress-card {
+    align-self: flex-start; width: min(85%, 420px); padding: 0;
+    background: #f4f7ff; border: 1px solid #dbe5ff; border-radius: 14px;
+    color: #53627a; font-size: .88rem;
+  }
+  .progress-card summary {
+    cursor: pointer; padding: 11px 14px; font-weight: 600; color: #365b9d;
+    list-style-position: inside; user-select: none;
+  }
+  .progress-card[open] summary { border-bottom: 1px solid #dbe5ff; }
+  .progress-steps { margin: 0; padding: 10px 18px 12px 34px; }
+  .progress-steps li { margin: 8px 0 10px; line-height: 1.4; }
+  .progress-steps li::marker { color: #5b7cfa; }
+  .progress-step-title { display: block; color: #435577; font-weight: 600; }
+  .progress-step-detail {
+    display: block; margin-top: 2px; color: #7b879d; font-size: .82rem;
+    line-height: 1.45; word-break: break-word;
+  }
+  .progress-step[data-status="running"] .progress-step-title::after {
+    content: ' · 处理中'; color: #5275db; font-size: .76rem; font-weight: 500;
+  }
+  .streaming-answer::after {
+    content: ''; display: inline-block; width: 7px; height: 1em;
+    margin-left: 3px; vertical-align: -2px; background: #2575fc;
+    animation: cursorBlink .8s step-end infinite;
+  }
+  @keyframes cursorBlink { 50% { opacity: 0; } }
+
+  .chat-input-area {
+    border-top: 1px solid #e9ecef; padding: 14px 16px;
+    display: flex; gap: 10px; background: #fff;
+  }
+  .chat-input {
+    flex: 1; padding: 11px 14px; border: 2px solid #e9ecef;
+    border-radius: 10px; font-size: .95rem; outline: none;
+    resize: none; font-family: inherit; max-height: 90px;
+  }
+  .chat-input:focus { border-color: #2575fc; }
+  .send-btn {
+    background: linear-gradient(135deg, #6a11cb, #2575fc);
+    color: #fff; border: none; border-radius: 10px; padding: 0 22px;
+    font-weight: 600; cursor: pointer; transition: opacity .2s;
+  }
+  .send-btn:hover { opacity: .9; }
+  .send-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  @media (max-width: 768px) {
+    #chatContainer { width: 94%; right: 3%; height: 72vh; bottom: 88px; }
+    #chatIcon { bottom: 20px; right: 20px; width: 62px; height: 62px; font-size: 26px; }
+    .houses { grid-template-columns: 1fr; }
+    header h1 { font-size: 1.9rem; }
+  }
+  @media (min-width: 1200px) {
+    #chatContainer { width: 500px; height: 650px; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>智能租房助手</h1>
+    <p class="subtitle">AI 智能推荐 · 预订 · 订单查询。只需描述您的需求，智能助手将为您匹配最合适的房源</p>
+    <span class="badge"><i class="fas fa-robot"></i>&nbsp; LangGraph 智能客服在线</span>
+  </header>
+
+  <div class="features">
+    <div class="feature-card">
+      <div class="feature-icon"><i class="fas fa-robot"></i></div>
+      <h3 class="feature-title">AI 智能推荐</h3>
+      <p class="feature-desc">描述城市、预算与房型，智能匹配最合适的房源</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon"><i class="fas fa-hand-holding-heart"></i></div>
+      <h3 class="feature-title">在线预订</h3>
+      <p class="feature-desc">说出房源名称与入住日期，一键生成订单</p>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon"><i class="fas fa-comments"></i></div>
+      <h3 class="feature-title">智能对话</h3>
+      <p class="feature-desc">多轮自然对话，随时查询您的历史订单</p>
+    </div>
+  </div>
+
+  <div class="house-list">
+    <h2 class="section-title">精选房源</h2>
+    <div class="houses" id="houses"></div>
+  </div>
+
+  <footer><p>© 智能租房助手 | 驱动：customer_service LangGraph 主图</p></footer>
+</div>
+
+<!-- 客服浮标 -->
+<div id="chatIcon" title="智能客服"><i class="fas fa-comment-dots"></i></div>
+
+<!-- 对话窗 -->
+<div id="chatContainer">
+  <div class="chat-header">
+    <span>安居智能客服</span>
+    <div class="tools">
+      <button id="btnNewChat" title="新会话"><i class="fas fa-plus"></i></button>
+      <button id="btnSessions" title="历史会话"><i class="fas fa-clock-rotate-left"></i></button>
+      <button id="closeChat" title="关闭"><i class="fas fa-times"></i></button>
+    </div>
+  </div>
+  <div id="sessionPanel">
+    <div class="session-panel-title">历史会话（点击恢复，最多显示最近 50 个）</div>
+    <div id="sessionList"></div>
+  </div>
+  <div class="chat-messages" id="chatMessages"></div>
+  <div class="chat-input-area">
+    <textarea class="chat-input" id="chatInput" rows="1" placeholder="例如：推荐合肥1500到3000元的房子"></textarea>
+    <button class="send-btn" id="sendBtn">发送</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ---------- 首页房源（本地图片） ---------- */
+  const HOUSES = [
+    { img: 'images/house-1.jpg', title: '整租·阳光公寓 1室1厅1卫', location: '合肥 滨湖新区', price: '2600', tags: ['近地铁', '精装修', '拎包入住'] },
+    { img: 'images/house-2.jpg', title: '整租·花园洋房 4室2厅', location: '合肥 蜀山区', price: '5200', tags: ['南北通透', '家电齐全', '小区安静'] },
+    { img: 'images/house-3.jpg', title: '合租·青年社区 主卧独卫', location: '合肥 高新区', price: '1800', tags: ['室友友好', '智能门锁', '公共区域'] },
+    { img: 'images/house-4.jpg', title: '整租·北欧两居 2室1厅', location: '合肥 政务区', price: '3200', tags: ['精装修', '电梯房', '拎包入住'] },
+    { img: 'images/house-5.jpg', title: '整租·温馨一居 1室1厅', location: '合肥 庐阳区', price: '2200', tags: ['采光好', '近商圈', '家电齐全'] },
+    { img: 'images/house-6.jpg', title: '整租·阳光三居 3室2厅', location: '合肥 包河区', price: '3800', tags: ['南北通透', '双阳台', '近地铁'] },
+  ];
+  const housesBox = document.getElementById('houses');
+  HOUSES.forEach(function (h) {
+    const card = document.createElement('div');
+    card.className = 'house-card';
+    card.innerHTML =
+      '<img src="' + h.img + '" alt="' + h.title + '" class="house-img" loading="lazy">' +
+      '<div class="house-info">' +
+      '  <h3 class="house-title">' + h.title + '</h3>' +
+      '  <div class="house-location"><i class="fas fa-map-marker-alt"></i>' + h.location + '</div>' +
+      '  <div class="house-price">¥' + h.price + '<small>/月</small></div>' +
+      '  <div class="house-tags">' + h.tags.map(function (t) { return '<span class="tag">' + t + '</span>'; }).join('') + '</div>' +
+      '</div>';
+    housesBox.appendChild(card);
+  });
+
+  /* ---------- 聊天状态 ---------- */
+  const WELCOME = '你好，我是安居智能客服 👋\n\n可以帮你：\n- **推荐房源**：推荐合肥1500到3000元的房子\n- **预订房源**：帮我预订合肥北城的房子\n- **查询订单**：查看我的订单\n- 回答其他租房问题';
+  const $ = function (id) { return document.getElementById(id); };
+  const chatMessages = $('chatMessages');
+  const chatInput = $('chatInput');
+  const sendBtn = $('sendBtn');
+  // 清理旧版本保存的线程 ID。当前线程只在本页面生命周期内保存，
+  // 刷新页面后固定开启新对话；服务端历史仍可通过历史按钮查看。
+  localStorage.removeItem('cw_thread');
+  let threadId = null;
+  let busy = false;
+
+  /* ---------- 消息渲染 ---------- */
+  function renderMarkdown(text) {
+    if (typeof marked !== 'undefined') return marked.parse(text);
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\n/g, '<br>');
+  }
+  function addMessage(role, content, isHtml) {
+    const el = document.createElement('div');
+    el.className = 'message ' + (role === 'user' ? 'user-message' : 'ai-message');
+    if (isHtml) el.innerHTML = content;
+    else el.textContent = content;
+    chatMessages.appendChild(el);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    return el;
+  }
+  function addProgressPanel() {
+    const panel = document.createElement('details');
+    panel.className = 'message progress-card';
+    panel.open = true;
+    const summary = document.createElement('summary');
+    summary.textContent = '正在处理您的问题…';
+    const steps = document.createElement('ol');
+    steps.className = 'progress-steps';
+    panel.appendChild(summary);
+    panel.appendChild(steps);
+    chatMessages.appendChild(panel);
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+    return { panel: panel, summary: summary, steps: steps, items: new Map() };
+  }
+  function updateProgressStep(progress, event) {
+    const stepId = event.step_id || event.title || event.text;
+    if (!stepId) return;
+    let item = progress.items.get(stepId);
+    if (!item) {
+      item = document.createElement('li');
+      item.className = 'progress-step';
+      const title = document.createElement('strong');
+      title.className = 'progress-step-title';
+      const detail = document.createElement('span');
+      detail.className = 'progress-step-detail';
+      item.appendChild(title);
+      item.appendChild(detail);
+      progress.steps.appendChild(item);
+      progress.items.set(stepId, item);
+    }
+    item.dataset.status = event.status || 'running';
+    item.querySelector('.progress-step-title').textContent = event.title || event.text;
+    item.querySelector('.progress-step-detail').textContent = event.detail || '';
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }
+  function finishProgress(progress) {
+    progress.summary.textContent = '已完成处理';
+    progress.panel.open = false;
+  }
+
+  async function readNdjson(response, onEvent) {
+    if (!response.body) throw new Error('浏览器不支持流式响应');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    while (true) {
+      const part = await reader.read();
+      buffer += decoder.decode(part.value || new Uint8Array(), { stream: !part.done });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      lines.forEach(function (line) {
+        if (line.trim()) onEvent(JSON.parse(line));
+      });
+      if (part.done) break;
+    }
+    if (buffer.trim()) onEvent(JSON.parse(buffer));
+  }
+
+  /* ---------- 发送：读取后端统一的 NDJSON 聊天事件流 ---------- */
+  async function sendMessage() {
+    const text = chatInput.value.trim();
+    if (!text || busy) return;
+    chatInput.value = '';
+    addMessage('user', text);
+    const progress = addProgressPanel();
+    let answer = null;
+    let answerText = '';
+    let finished = false;
+    busy = true;
+    sendBtn.disabled = true;
+    chatInput.disabled = true;
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: text, thread_id: threadId }),
+      });
+      if (!res.ok) {
+        let errorText = 'HTTP ' + res.status;
+        try { errorText = (await res.json()).error || errorText; } catch (_) {}
+        throw new Error(errorText);
+      }
+      await readNdjson(res, function (event) {
+        if (event.type === 'thread') {
+          threadId = event.thread_id;
+          return;
+        }
+        if (event.type === 'progress') {
+          updateProgressStep(progress, event);
+          return;
+        }
+        if (event.type === 'token') {
+          if (!answer) {
+            finishProgress(progress);
+            answer = addMessage('ai', '', false);
+            answer.classList.add('streaming-answer');
+          }
+          answerText += event.text || '';
+          answer.textContent = answerText;
+          chatMessages.scrollTop = chatMessages.scrollHeight;
+          return;
+        }
+        if (event.type === 'interrupt') {
+          finishProgress(progress);
+          if (!answer) answer = addMessage('ai', '', false);
+          answerText = event.text || '正在等待您补充信息，请直接回复。';
+          answer.textContent = answerText;
+          return;
+        }
+        if (event.type === 'error') {
+          throw new Error(event.message || '聊天流执行失败');
+        }
+        if (event.type === 'done') finished = true;
+      });
+      if (!finished) throw new Error('服务端流式响应意外结束');
+      finishProgress(progress);
+      if (answer) {
+        answer.classList.remove('streaming-answer');
+        answer.innerHTML = renderMarkdown(answerText);
+      }
+    } catch (err) {
+      finishProgress(progress);
+      if (answer) answer.classList.remove('streaming-answer');
+      const errorMessage = '⚠️ 连接客服失败：' + err.message +
+        '\n\n请确认已启动 AI 大脑：\ncd 项目目录 && source .venv/bin/activate && langgraph dev';
+      if (answer && !answerText) {
+        answer.classList.add('error');
+        answer.textContent = errorMessage;
+      } else {
+        const errorEl = addMessage('ai', errorMessage, false);
+        errorEl.classList.add('error');
+      }
+    } finally {
+      busy = false;
+      sendBtn.disabled = false;
+      chatInput.disabled = false;
+      chatInput.focus();
+    }
+  }
+  sendBtn.addEventListener('click', sendMessage);
+  chatInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+  });
+
+  /* ---------- 新会话：清掉线程 ID，后端下次会创建全新线程 ---------- */
+  $('btnNewChat').addEventListener('click', function () {
+    threadId = null;
+    chatMessages.innerHTML = '';
+    addMessage('ai', renderMarkdown(WELCOME), true);
+  });
+
+  /* ---------- 历史会话：列出以往会话，点击恢复 ---------- */
+  function escapeHtml(text) {
+    return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  async function openSession(tid) {
+    $('sessionPanel').classList.remove('open');
+    threadId = tid;
+    chatMessages.innerHTML = '';
+    addMessage('ai', '正在加载会话…', false);
+    try {
+      const res = await fetch('/api/sessions/' + encodeURIComponent(tid) + '/messages');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+      chatMessages.innerHTML = '';
+      const msgs = data.messages || [];
+      msgs.forEach(function (m) {
+        addMessage(m.role === 'human' ? 'user' : 'ai', renderMarkdown(m.content), true);
+      });
+      if (!msgs.length) addMessage('ai', '（该会话暂无消息）', false);
+    } catch (err) {
+      chatMessages.innerHTML = '';
+      addMessage('ai', '⚠️ 加载会话失败：' + err.message, false);
+    }
+  }
+  $('btnSessions').addEventListener('click', async function () {
+    const panel = $('sessionPanel');
+    if (panel.classList.contains('open')) { panel.classList.remove('open'); return; }
+    panel.classList.add('open');
+    const listEl = $('sessionList');
+    listEl.innerHTML = '<div class="session-item" style="color:#999">加载中…</div>';
+    try {
+      const res = await fetch('/api/sessions');
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+      const sessions = data.sessions || [];
+      listEl.innerHTML = '';
+      if (!sessions.length) {
+        listEl.innerHTML = '<div class="session-item" style="color:#999">暂无历史会话</div>';
+        return;
+      }
+      sessions.forEach(function (s) {
+        const el = document.createElement('div');
+        el.className = 'session-item' + (s.thread_id === threadId ? ' active' : '');
+        const time = s.updated_at ? new Date(s.updated_at).toLocaleString('zh-CN') : '';
+        el.innerHTML =
+          '<div class="session-id">' + escapeHtml(s.thread_id) + '</div>' +
+          '<div class="session-time">' + escapeHtml(time) + '</div>' +
+          '<div class="session-preview">' + escapeHtml(s.last_message || '（无消息记录）') + '</div>';
+        el.addEventListener('click', function () { openSession(s.thread_id); });
+        listEl.appendChild(el);
+      });
+    } catch (err) {
+      listEl.innerHTML = '<div class="session-item" style="color:#b91c1c">加载失败：' + escapeHtml(err.message) + '</div>';
+    }
+  });
+
+  /* ---------- 浮标拖动 ---------- */
+  const chatIcon = $('chatIcon');
+  const chatContainer = $('chatContainer');
+  let dragging = false, moved = false, startX = 0, startY = 0, origX = 0, origY = 0;
+  chatIcon.addEventListener('pointerdown', function (e) {
+    dragging = true; moved = false;
+    startX = e.clientX; startY = e.clientY;
+    const r = chatIcon.getBoundingClientRect();
+    origX = r.left; origY = r.top;
+    chatIcon.setPointerCapture(e.pointerId);
+  });
+  chatIcon.addEventListener('pointermove', function (e) {
+    if (!dragging) return;
+    const dx = e.clientX - startX, dy = e.clientY - startY;
+    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) moved = true;
+    chatIcon.style.left = Math.max(0, Math.min(window.innerWidth - 60, origX + dx)) + 'px';
+    chatIcon.style.top = Math.max(0, Math.min(window.innerHeight - 60, origY + dy)) + 'px';
+    chatIcon.style.right = 'auto';
+    chatIcon.style.bottom = 'auto';
+  });
+  chatIcon.addEventListener('pointerup', function () {
+    dragging = false;
+    if (!moved) {
+      chatContainer.style.display = chatContainer.style.display === 'flex' ? 'none' : 'flex';
+      if (chatContainer.style.display === 'flex') {
+        setTimeout(function () { chatMessages.scrollTop = chatMessages.scrollHeight; }, 100);
+      }
+    }
+  });
+
+  /* ---------- 对话窗控制 ---------- */
+  $('closeChat').addEventListener('click', function () {
+    chatContainer.style.display = 'none';
+  });
+
+  /* ---------- 开场白 ---------- */
+  addMessage('ai', renderMarkdown(WELCOME), true);
+})();
+</script>
+</body>
+</html>

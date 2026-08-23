@@ -1,0 +1,29 @@
+[project]
+name = "multi-agent-customer-service"
+version = "0.1.0"
+description = "A LangGraph supervisor with tool-using specialist agents for rental customer service."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28,<1.0",
+    "langchain>=1.0,<2.0",
+    "langchain-community==0.4.2",
+    "langchain-deepseek>=1.0,<2.0",
+    "langgraph>=1.0,<2.0",
+    "langgraph-checkpoint-postgres>=3.0,<4.0",
+    "playwright>=1.50,<2.0",
+    "psycopg[binary,pool]>=3.2,<4.0",
+    "python-dotenv>=1.0,<2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "langgraph-cli[inmem]>=0.4,<1.0",
+]
+
+[build-system]
+requires = ["setuptools>=73", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

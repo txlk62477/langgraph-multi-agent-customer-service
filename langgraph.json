@@ -1,0 +1,21 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "dependencies": ["."],
+  "graphs": {
+    "customer_service": "./src/agent/supervisor/graph.py:customer_service_graph",
+    "general_qa_agent": "./src/agent/agents/general_qa.py:general_qa_agent",
+    "rental_recommendation_agent": "./src/agent/agents/rental_recommendation.py:rental_recommendation_agent",
+    "rental_booking_agent": "./src/agent/agents/rental_booking.py:rental_booking_agent",
+    "order_history_agent": "./src/agent/agents/order_history.py:order_history_agent",
+    "order_cancellation_agent": "./src/agent/agents/order_cancellation.py:order_cancellation_agent"
+  },
+  "env": ".env",
+  "checkpointer": {
+    "path": "./src/agent/checkpointer.py:generate_checkpointer"
+  },
+  "python_version": "3.12",
+  "image_distro": "debian",
+  "dockerfile_lines": [
+    "RUN pip install --no-cache-dir 'playwright>=1.50,<2.0' && python -m playwright install --with-deps chromium"
+  ]
+}
