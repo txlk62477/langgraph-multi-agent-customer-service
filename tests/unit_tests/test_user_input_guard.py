@@ -94,7 +94,9 @@ class UserInputGuardTests(unittest.TestCase):
             Runtime(),
         )
 
-        self.assertIsNone(result)
+        self.assertEqual(result["last_guard_event"]["result"], "pass")
+        self.assertEqual(result["last_guard_event"]["source"], "llm")
+        self.assertEqual(result["last_guard_event"]["reason"], "只是礼貌结束")
         self.assertEqual(model.calls, 1)
 
     def test_explicit_closing_rule_skips_classifier(self) -> None:
@@ -104,18 +106,69 @@ class UserInputGuardTests(unittest.TestCase):
             Runtime(),
         )
 
-        self.assertIsNone(result)
+        self.assertEqual(result["last_guard_event"]["result"], "terminal")
+        self.assertEqual(result["last_guard_event"]["source"], "hard_rule")
         self.assertEqual(model.calls, 0)
 
     def test_classifier_failure_is_fail_open(self) -> None:
         model = ClassifierModel(error=RuntimeError("分类服务不可用"))
         result = self._guard(model).after_model(
-            {"messages": [AIMessage(content="您倾向第一套还是第二套？")]},
+            {
+                "messages": [
+                    AIMessage(
+                        content="您倾向第一套还是第二套？",
+                        id="ambiguous-question",
+                    )
+                ]
+            },
             Runtime(),
         )
 
-        self.assertIsNone(result)
+        self.assertNotIn("messages", result)
+        self.assertEqual(
+            result["last_guard_event"],
+            {
+                "message_id": "ambiguous-question",
+                "result": "pass",
+                "source": "fallback",
+                "requires_user_input": False,
+                "missing_fields": [],
+                "reason": "分类器失败且没有识别出明确缺失字段",
+                "error": "RuntimeError: 分类服务不可用",
+            },
+        )
         self.assertEqual(model.calls, 1)
+
+    def test_classifier_failure_with_explicit_fields_falls_back_to_interrupt(self) -> None:
+        model = ClassifierModel(error=RuntimeError("分类服务不可用"))
+        message = AIMessage(
+            content="请问您的手机号是多少？入住日期和退房日期分别是哪天？",
+            id="explicit-fields-question",
+        )
+
+        result = self._guard(model).after_model(
+            {"messages": [message]},
+            Runtime(),
+        )
+
+        call = result["messages"][0].tool_calls[0]
+        self.assertEqual(call["name"], "request_user_input")
+        self.assertEqual(
+            call["args"]["missing_fields"],
+            ["phone", "check_in_date", "check_out_date"],
+        )
+        self.assertEqual(
+            result["last_guard_event"],
+            {
+                "message_id": "explicit-fields-question",
+                "result": "request",
+                "source": "fallback",
+                "requires_user_input": True,
+                "missing_fields": ["phone", "check_in_date", "check_out_date"],
+                "reason": "分类器失败，但已识别出明确缺失字段",
+                "error": "RuntimeError: 分类服务不可用",
+            },
+        )
 
     def test_existing_tool_call_is_never_modified(self) -> None:
         model = ClassifierModel(error=AssertionError("不应调用分类器"))

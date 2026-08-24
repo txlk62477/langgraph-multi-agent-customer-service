@@ -18,6 +18,7 @@ from agent.node.preferences import (
     PreferenceExtractionDecision,
     PreferenceUpdateNode,
     _build_preference_delta,
+    load_preferences,
 )
 
 
@@ -68,15 +69,52 @@ class PreferenceValidationTests(unittest.TestCase):
 
 
 class UpdatePreferencesNodeTests(unittest.TestCase):
+    def test_load_preferences_returns_compact_public_state(self) -> None:
+        result = load_preferences(
+            {"messages": [HumanMessage(content="推荐上海的房子", id="turn-start")]},
+            {"configurable": {"user_id": "state-user"}},
+            Runtime(store=InMemoryStore()),
+        )
+
+        self.assertEqual(result["user_id"], "state-user")
+        self.assertEqual(result["user_preferences"], {})
+        self.assertEqual(
+            result["preference_status"],
+            {
+                "loaded": True,
+                "saved": False,
+                "load_error": "",
+                "extraction_error": "",
+                "save_error": "",
+            },
+        )
+        self.assertEqual(result["current_turn_start_message_id"], "turn-start")
+        for obsolete_field in (
+            "preference_updates",
+            "preference_clear_fields",
+            "preference_load_error",
+            "preference_extraction_error",
+            "preferences_saved",
+            "preference_save_error",
+            "delegation_count",
+            "delegated_agents",
+        ):
+            self.assertNotIn(obsolete_field, result)
+
     def test_saves_only_explicit_updates_and_clears_delta(self) -> None:
         store = InMemoryStore()
-        result = PreferenceUpdateNode(model_factory=lambda: Mock())(
+        model = FakePreferenceExtractionModel(
+            PreferenceExtractionDecision(
+                rental_related=True,
+                city="上海",
+                districts_to_add=["浦东新区"],
+                reason="用户明确表达租房地点",
+            )
+        )
+        result = PreferenceUpdateNode(model_factory=lambda: model)(
             {
-                "preference_updates": {
-                    "city": "上海",
-                    "districts": ["浦东新区"],
-                    "budget_min": None,
-                }
+                "messages": [HumanMessage(content="想在上海浦东租房", id="turn")],
+                "current_turn_start_message_id": "turn",
             },
             {"configurable": {"user_id": "user-1"}},
             Runtime(store=store),
@@ -86,8 +124,8 @@ class UpdatePreferencesNodeTests(unittest.TestCase):
         self.assertIsNotNone(item)
         self.assertEqual(item.value["city"], "上海")
         self.assertEqual(item.value["districts"], ["浦东新区"])
-        self.assertTrue(result["preferences_saved"])
-        self.assertEqual(result["preference_updates"], {})
+        self.assertTrue(result["preference_status"]["saved"])
+        self.assertNotIn("preference_updates", result)
         self.assertEqual(result["user_preferences"]["city"], "上海")
 
     def test_uses_chat_user_id_for_studio_and_skips_empty_updates(self) -> None:
@@ -95,20 +133,44 @@ class UpdatePreferencesNodeTests(unittest.TestCase):
         runtime = Runtime(store=store)
 
         with patch.dict(os.environ, {"CHAT_USER_ID": "studio-user"}):
-            node = PreferenceUpdateNode(model_factory=lambda: Mock())
-            saved = node(
-                {"preference_updates": {"city": "成都"}}, {}, runtime
+            saved = PreferenceUpdateNode(
+                model_factory=lambda: FakePreferenceExtractionModel(
+                    PreferenceExtractionDecision(
+                        rental_related=True,
+                        city="成都",
+                        reason="用户明确表达租房城市",
+                    )
+                )
+            )(
+                {
+                    "messages": [HumanMessage(content="想在成都租房", id="saved")],
+                    "current_turn_start_message_id": "saved",
+                },
+                {},
+                runtime,
             )
-            skipped = node(
-                {"preference_updates": {}}, {}, runtime
+            skipped = PreferenceUpdateNode(
+                model_factory=lambda: FakePreferenceExtractionModel(
+                    PreferenceExtractionDecision(
+                        rental_related=False,
+                        reason="没有偏好变化",
+                    )
+                )
+            )(
+                {
+                    "messages": [HumanMessage(content="你好", id="skipped")],
+                    "current_turn_start_message_id": "skipped",
+                },
+                {},
+                runtime,
             )
 
         item = store.get(
             preference_namespace("studio-user"), PREFERENCE_STORE_KEY
         )
         self.assertEqual(item.value["city"], "成都")
-        self.assertTrue(saved["preferences_saved"])
-        self.assertFalse(skipped["preferences_saved"])
+        self.assertTrue(saved["preference_status"]["saved"])
+        self.assertFalse(skipped["preference_status"]["saved"])
 
     def test_clears_explicit_field_in_store_profile(self) -> None:
         store = InMemoryStore()
@@ -118,11 +180,19 @@ class UpdatePreferencesNodeTests(unittest.TestCase):
             {"user_id": "lk", "city": "合肥", "districts": ["北城"]},
             index=False,
         )
-        result = PreferenceUpdateNode(model_factory=lambda: Mock())(
+        model = FakePreferenceExtractionModel(
+            PreferenceExtractionDecision(
+                rental_related=True,
+                clear_districts=True,
+                reason="用户明确取消区域偏好",
+            )
+        )
+        result = PreferenceUpdateNode(model_factory=lambda: model)(
             {
                 "user_id": "lk",
-                "preference_updates": {},
-                "preference_clear_fields": ["districts"],
+                "messages": [HumanMessage(content="不限制区域了", id="turn")],
+                "user_preferences": {"city": "合肥", "districts": ["北城"]},
+                "current_turn_start_message_id": "turn",
             },
             {},
             Runtime(store=store),
@@ -131,27 +201,34 @@ class UpdatePreferencesNodeTests(unittest.TestCase):
         item = store.get(preference_namespace("lk"), PREFERENCE_STORE_KEY)
         self.assertNotIn("districts", item.value)
         self.assertEqual(item.value["city"], "合肥")
-        self.assertTrue(result["preferences_saved"])
-        self.assertEqual(result["preference_clear_fields"], [])
+        self.assertTrue(result["preference_status"]["saved"])
+        self.assertNotIn("preference_clear_fields", result)
 
     def test_store_failure_is_fail_open_and_clears_pending_delta(self) -> None:
         store = Mock()
         store.get.side_effect = RuntimeError("Store暂时不可用")
 
-        result = PreferenceUpdateNode(model_factory=lambda: Mock())(
+        model = FakePreferenceExtractionModel(
+            PreferenceExtractionDecision(
+                rental_related=True,
+                city="上海",
+                reason="用户明确表达租房城市",
+            )
+        )
+        result = PreferenceUpdateNode(model_factory=lambda: model)(
             {
-                "preference_updates": {"city": "上海"},
-                "preference_clear_fields": ["districts"],
+                "messages": [HumanMessage(content="想在上海租房", id="turn")],
+                "current_turn_start_message_id": "turn",
             },
             {"configurable": {"user_id": "user-1"}},
             Runtime(store=store),
         )
 
-        self.assertFalse(result["preferences_saved"])
+        self.assertFalse(result["preference_status"]["saved"])
         self.assertEqual(result["user_id"], "user-1")
-        self.assertEqual(result["preference_updates"], {})
-        self.assertEqual(result["preference_clear_fields"], [])
-        self.assertIn("Store暂时不可用", result["preference_save_error"])
+        self.assertNotIn("preference_updates", result)
+        self.assertNotIn("preference_clear_fields", result)
+        self.assertIn("Store暂时不可用", result["preference_status"]["save_error"])
 
 class PreferenceExtractionAndSaveTests(unittest.TestCase):
     def test_sends_all_messages_from_current_turn_to_model(self) -> None:
@@ -191,7 +268,7 @@ class PreferenceExtractionAndSaveTests(unittest.TestCase):
         self.assertEqual(model.method, "function_calling")
         self.assertEqual(result["user_preferences"]["city"], "合肥")
         self.assertEqual(result["user_preferences"]["districts"], ["北城"])
-        self.assertTrue(result["preferences_saved"])
+        self.assertTrue(result["preference_status"]["saved"])
         self.assertIsNone(result["current_turn_start_message_id"])
 
     def test_non_rental_turn_does_not_create_updates(self) -> None:
@@ -217,10 +294,10 @@ class PreferenceExtractionAndSaveTests(unittest.TestCase):
         )
 
         self.assertNotIn("preference_updates", result)
-        self.assertEqual(result["preference_extraction_error"], "")
+        self.assertEqual(result["preference_status"]["extraction_error"], "")
         self.assertIsNone(result["current_turn_start_message_id"])
 
-    def test_extraction_failure_does_not_discard_existing_updates(self) -> None:
+    def test_extraction_failure_is_exposed_without_internal_delta(self) -> None:
         node = PreferenceUpdateNode(
             model_factory=lambda: (_ for _ in ()).throw(RuntimeError("不可用"))
         )
@@ -229,7 +306,6 @@ class PreferenceExtractionAndSaveTests(unittest.TestCase):
         result = node(
             {
                 "messages": [HumanMessage(content="想在合肥租房", id="turn-start")],
-                "preference_updates": {"city": "合肥"},
                 "current_turn_start_message_id": "turn-start",
             },
             {"configurable": {"user_id": "failure-user"}},
@@ -237,7 +313,7 @@ class PreferenceExtractionAndSaveTests(unittest.TestCase):
         )
 
         self.assertNotIn("preference_updates", result)
-        self.assertIn("RuntimeError", result["preference_extraction_error"])
+        self.assertIn("RuntimeError", result["preference_status"]["extraction_error"])
         self.assertIsNone(result["current_turn_start_message_id"])
         store.get.assert_not_called()
 
@@ -246,8 +322,6 @@ class PreferenceMergeTests(unittest.TestCase):
     def test_appends_districts_in_same_city(self) -> None:
         updates, clear_fields = _build_preference_delta(
             stored_preferences={"city": "合肥", "districts": ["北城"]},
-            pending_updates={},
-            pending_clear_fields=[],
             decision=PreferenceExtractionDecision(
                 rental_related=True,
                 city="合肥",
@@ -261,8 +335,6 @@ class PreferenceMergeTests(unittest.TestCase):
     def test_changing_city_discards_old_districts(self) -> None:
         updates, clear_fields = _build_preference_delta(
             stored_preferences={"city": "上海", "districts": ["浦东"]},
-            pending_updates={},
-            pending_clear_fields=[],
             decision=PreferenceExtractionDecision(
                 rental_related=True,
                 city="合肥",
@@ -279,8 +351,6 @@ class PreferenceMergeTests(unittest.TestCase):
     def test_removing_last_list_value_clears_store_field(self) -> None:
         updates, clear_fields = _build_preference_delta(
             stored_preferences={"city": "合肥", "districts": ["北城"]},
-            pending_updates={},
-            pending_clear_fields=[],
             decision=PreferenceExtractionDecision(
                 rental_related=True,
                 districts_to_remove=["北城"],
@@ -293,8 +363,6 @@ class PreferenceMergeTests(unittest.TestCase):
     def test_new_budget_boundary_clears_conflicting_old_boundary(self) -> None:
         updates, clear_fields = _build_preference_delta(
             stored_preferences={"budget_min": 4000, "budget_max": 6000},
-            pending_updates={},
-            pending_clear_fields=[],
             decision=PreferenceExtractionDecision(
                 rental_related=True,
                 budget_max=3000,

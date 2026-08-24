@@ -1,39 +1,27 @@
-"""用户偏好保存节点使用的状态定义。"""
+"""可供主图继承的用户偏好状态接口。"""
 
 from typing import Any, NotRequired, TypedDict
 
-from langchain_core.messages import AnyMessage
+from langchain.agents.middleware.types import AgentState
 
-from agent.common.preferences import PreferenceField
+class PreferenceStatus(TypedDict):
+    """最近一次偏好读取或更新的可观测状态。"""
 
-
-class PreferenceUpdates(TypedDict, total=False):
-    """业务子图本轮明确收集到的偏好增量。"""
-
-    city: str
-    districts: list[str]
-    budget_min: float
-    budget_max: float
-    room_types: list[str]
-    rental_mode: str
-    commute_location: str
-    max_commute_minutes: int
+    loaded: bool
+    saved: bool
+    load_error: str
+    extraction_error: str
+    save_error: str
 
 
-class PreferenceState(TypedDict, total=False):
-    """主图中与跨会话用户偏好有关的公共状态。"""
+class PreferenceState(AgentState[Any]):
+    """所有需要跨会话租房偏好的 Agent 图状态基类。"""
 
     # 正式运行时应由调用方传入 user_id；Studio 调试可回退到 CHAT_USER_ID。
-    user_id: str
-    # update_preferences 从当前业务流程起点读取全部 Human/AI 消息。
-    messages: NotRequired[list[AnyMessage]]
+    user_id: NotRequired[str]
     # 由主图入口设置，供偏好提取节点确定本轮业务消息的起点。
     current_turn_start_message_id: NotRequired[str | None]
-    preference_updates: PreferenceUpdates
-    # 需要显式写成数据库NULL的字段；与“本轮没有提到”严格区分。
-    preference_clear_fields: list[PreferenceField]
-    user_preferences: dict[str, Any]
-    preference_load_error: str
-    preference_extraction_error: str
-    preferences_saved: NotRequired[bool]
-    preference_save_error: NotRequired[str]
+    # Store 中加载的完整偏好快照，专业 Agent 只读使用。
+    user_preferences: NotRequired[dict[str, Any]]
+    # 偏好节点的紧凑诊断；提取增量和清空字段只在节点内部流转。
+    preference_status: NotRequired[PreferenceStatus]

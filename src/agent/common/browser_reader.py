@@ -103,6 +103,7 @@ async def _read_one_page(
     enriched.update(
         {
             "browser_status": "failed",
+            "http_status": None,
             "rendered_text": "",
             "json_responses": [],
             "browser_error": "",
@@ -153,10 +154,13 @@ async def _read_one_page(
             response_tasks.append(task)
 
         page.on("response", schedule_response)
-        await page.goto(
+        navigation_response = await page.goto(
             url,
             wait_until="domcontentloaded",
             timeout=NAVIGATION_TIMEOUT_MS,
+        )
+        enriched["http_status"] = (
+            navigation_response.status if navigation_response is not None else None
         )
         await page.wait_for_timeout(RENDER_WAIT_MS)
 
@@ -264,6 +268,7 @@ def _read_one_page_sync(
     enriched.update(
         {
             "browser_status": "failed",
+            "http_status": None,
             "rendered_text": "",
             "json_responses": [],
             "browser_error": "",
@@ -316,10 +321,13 @@ def _read_one_page_sync(
                 json_responses.append(item)
 
         page.on("response", collect_response)
-        page.goto(
+        navigation_response = page.goto(
             url,
             wait_until="domcontentloaded",
             timeout=NAVIGATION_TIMEOUT_MS,
+        )
+        enriched["http_status"] = (
+            navigation_response.status if navigation_response is not None else None
         )
         page.wait_for_timeout(RENDER_WAIT_MS)
 

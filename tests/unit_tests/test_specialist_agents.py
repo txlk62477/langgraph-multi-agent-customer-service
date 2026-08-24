@@ -21,6 +21,8 @@ from agent.agents import (
     rental_recommendation_agent,
 )
 from agent.agents.general_qa import build_general_qa_agent
+from agent.agents.factory import build_specialist_agent
+from agent.agents.specialist_budget import SpecialistBudgetPolicy
 from agent.agents.order_cancellation import build_order_cancellation_agent
 from agent.agents.order_history import build_order_history_agent
 from agent.agents.rental_booking import build_rental_booking_agent
@@ -31,6 +33,7 @@ from agent.common.booking_db import (
     OrderRecord,
 )
 from agent.node.preferences import PreferenceExtractionDecision
+from agent.state.customer_service import SpecialistResult
 from agent.supervisor.graph import build_customer_service_graph
 from agent.tools.conversation import build_request_user_input_tool
 from agent.tools.orders import build_cancel_order_tool, build_find_cancellable_orders_tool
@@ -62,7 +65,12 @@ class ScriptedToolModel(BaseChatModel):
 
     def bind_tools(self, tools, **kwargs):
         del kwargs
-        self._bound_tool_names = [tool.name for tool in tools]
+        self._bound_tool_names = [
+            tool.name
+            if hasattr(tool, "name")
+            else tool["function"]["name"]
+            for tool in tools
+        ]
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
@@ -144,6 +152,48 @@ class FakeRentalCatalog:
 
 
 class SpecialistAgentTests(unittest.TestCase):
+    def test_specialist_returns_structured_result_after_finishing(self) -> None:
+        model = ScriptedToolModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "SpecialistResult",
+                            "args": {
+                                "agent": "general_qa_agent",
+                                "status": "success",
+                                "summary": "已完成知识回答",
+                                "user_facing_answer": "合肥是安徽省省会。",
+                                "completed_tasks": ["回答省会问题"],
+                                "remaining_tasks": [],
+                            },
+                            "id": "structured-result",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        )
+        graph = build_general_qa_agent(
+            model_factory=lambda: model,
+            name="structured_general_qa_agent",
+        )
+
+        result = graph.invoke({"messages": [HumanMessage(content="安徽省会是哪里？")]})
+
+        self.assertEqual(
+            result["structured_response"],
+            SpecialistResult(
+                agent="general_qa_agent",
+                status="success",
+                summary="已完成知识回答",
+                user_facing_answer="合肥是安徽省省会。",
+                completed_tasks=["回答省会问题"],
+                remaining_tasks=[],
+            ),
+        )
+
     def test_all_specialists_are_react_tool_loops(self) -> None:
         guarded = {
             rental_recommendation_agent.name,
@@ -161,8 +211,11 @@ class SpecialistAgentTests(unittest.TestCase):
                 nodes = set(graph.get_graph().nodes)
                 expected = {
                     "__start__",
+                    "SpecialistBudgetMiddleware.before_agent",
                     "SummarizationMiddleware.before_model",
+                    "SpecialistBudgetMiddleware.before_model",
                     "model",
+                    "SpecialistBudgetMiddleware.after_model",
                     "tools",
                     "__end__",
                 }
@@ -184,6 +237,7 @@ class SpecialistAgentTests(unittest.TestCase):
                 "anysearch_search",
                 "playwright_read_page",
                 "analyze_page_visuals",
+                "SpecialistResult",
             ],
         )
         prompt = "\n".join(
@@ -246,7 +300,10 @@ class SpecialistAgentTests(unittest.TestCase):
                     {"messages": [HumanMessage(content="测试")]},
                     config={"configurable": {"user_id": "user-1"}},
                 )
-                self.assertEqual(set(model.bound_tool_names), expected)
+                self.assertEqual(
+                    set(model.bound_tool_names),
+                    expected | {"SpecialistResult"},
+                )
 
     def test_order_history_agent_uses_runtime_identity_and_tool(self) -> None:
         db = FakeBookingDB()
@@ -339,6 +396,24 @@ class SpecialistAgentTests(unittest.TestCase):
                     ],
                 ),
                 AIMessage(content="预订成功，订单号 agent-order-1。"),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "SpecialistResult",
+                            "args": {
+                                "agent": "rental_booking_agent",
+                                "status": "success",
+                                "summary": "已开始新的预订任务",
+                                "user_facing_answer": "请告诉我需要预订哪套房源。",
+                                "completed_tasks": [],
+                                "remaining_tasks": ["确认房源"],
+                            },
+                            "id": "new-turn-result",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
             ]
         )
         graph = build_rental_booking_agent(
@@ -360,6 +435,17 @@ class SpecialistAgentTests(unittest.TestCase):
         self.assertEqual(len(db.created), 1)
         self.assertEqual(db.created[0]["user_id"], "u-1")
         self.assertIn("agent-order-1", result["messages"][-1].content)
+        resumed_budget = graph.get_state(config).values["specialist_budget"]
+        self.assertEqual(resumed_budget["model_calls"], 3)
+        self.assertEqual(resumed_budget["business_tool_calls"], 1)
+
+        graph.invoke(
+            {"messages": [HumanMessage(content="再预订另一套房")]},
+            config=config,
+        )
+        new_turn_budget = graph.get_state(config).values["specialist_budget"]
+        self.assertEqual(new_turn_budget["model_calls"], 1)
+        self.assertEqual(new_turn_budget["business_tool_calls"], 0)
 
     def test_booking_plain_text_question_is_converted_to_interrupt(self) -> None:
         """模型忘记调用工具时，用户补充问题仍必须进入 interrupt。"""
@@ -416,6 +502,13 @@ class SpecialistAgentTests(unittest.TestCase):
         self.assertEqual(payload["type"], "agent_request_user_input")
         self.assertEqual(
             payload["missing_required_fields"],
+            ["house_id", "phone", "check_in_date", "check_out_date"],
+        )
+        guard_event = graph.get_state(config).values["last_guard_event"]
+        self.assertEqual(guard_event["result"], "request")
+        self.assertEqual(guard_event["source"], "hard_rule")
+        self.assertEqual(
+            guard_event["missing_fields"],
             ["house_id", "phone", "check_in_date", "check_out_date"],
         )
 
@@ -537,15 +630,29 @@ class SupervisorTests(unittest.TestCase):
 
     @staticmethod
     def _specialists(**overrides):
-        def specialist(label: str):
-            return lambda state: {"messages": [AIMessage(content=label)]}
+        def specialist(agent: str, label: str):
+            return lambda state: {
+                "messages": [AIMessage(content=f"内部消息：{label}", name=agent)],
+                "structured_response": SpecialistResult(
+                    agent=agent,
+                    status="success",
+                    summary=label,
+                    user_facing_answer=label,
+                    completed_tasks=[label],
+                    remaining_tasks=[],
+                ),
+            }
 
         defaults = {
-            "general_qa_agent": specialist("常规问答结果"),
-            "rental_recommendation_agent": specialist("房源推荐结果"),
-            "rental_booking_agent": specialist("预订结果"),
-            "order_history_agent": specialist("历史订单结果"),
-            "order_cancellation_agent": specialist("取消结果"),
+            "general_qa_agent": specialist("general_qa_agent", "常规问答结果"),
+            "rental_recommendation_agent": specialist(
+                "rental_recommendation_agent", "房源推荐结果"
+            ),
+            "rental_booking_agent": specialist("rental_booking_agent", "预订结果"),
+            "order_history_agent": specialist("order_history_agent", "历史订单结果"),
+            "order_cancellation_agent": specialist(
+                "order_cancellation_agent", "取消结果"
+            ),
         }
         defaults.update(overrides)
         return defaults
@@ -588,8 +695,35 @@ class SupervisorTests(unittest.TestCase):
         state = graph.get_state(config).values
 
         self.assertEqual(result["messages"][-1].content, "您有一笔历史订单。")
-        self.assertEqual(state["delegation_count"], 1)
-        self.assertEqual(state["delegated_agents"], ["order_history_agent"])
+        self.assertEqual(
+            state["delegations"],
+            [
+                {
+                    "agent": "order_history_agent",
+                    "task": "查询当前用户的历史订单",
+                    "tool_call_id": "handoff-history",
+                    "result": {
+                        "agent": "order_history_agent",
+                        "status": "success",
+                        "summary": "历史订单结果",
+                        "user_facing_answer": "历史订单结果",
+                        "completed_tasks": ["历史订单结果"],
+                        "remaining_tasks": [],
+                    },
+                }
+            ],
+        )
+        self.assertNotIn("delegation_count", state)
+        self.assertNotIn("delegated_agents", state)
+        self.assertTrue(
+            any("历史订单结果" in str(message.content) for message in supervisor_model.seen_messages)
+        )
+        self.assertFalse(
+            any("内部消息" in str(message.content) for message in supervisor_model.seen_messages)
+        )
+        self.assertTrue(
+            any("内部消息：历史订单结果" in str(message.content) for message in state["messages"])
+        )
         self.assertEqual(
             set(supervisor_model.bound_tool_names),
             {
@@ -599,6 +733,63 @@ class SupervisorTests(unittest.TestCase):
                 "delegate_to_order_history",
                 "delegate_to_order_cancellation",
             },
+        )
+
+    def test_supervisor_collects_specialist_budget_fallback(self) -> None:
+        supervisor_model = ScriptedToolModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "delegate_to_general_qa",
+                            "args": {"task": "查询天气"},
+                            "id": "handoff-budget-fallback",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="本次天气查询达到执行上限，请稍后重试。"),
+            ]
+        )
+        specialist_model = ScriptedToolModel([AIMessage(content="未按结构结束")])
+        limited_specialist = build_specialist_agent(
+            name="limited_general_qa_agent",
+            specialist_name="general_qa_agent",
+            system_prompt="处理测试任务",
+            tools=[],
+            model_factory=lambda: specialist_model,
+            middleware=[],
+            budget_policy=SpecialistBudgetPolicy(
+                business_tool_calls=1,
+                model_calls=1,
+            ),
+        )
+        graph = build_customer_service_graph(
+            model_factory=lambda: supervisor_model,
+            preference_model_factory=self._preference_model,
+            specialists=self._specialists(general_qa_agent=limited_specialist),
+            store=InMemoryStore(),
+            checkpointer=InMemorySaver(),
+            name="test_supervisor_budget_fallback",
+        )
+        config = {
+            "configurable": {
+                "thread_id": "supervisor-budget-fallback",
+                "user_id": "supervisor-user",
+            }
+        }
+
+        graph.invoke(
+            {"messages": [HumanMessage(content="合肥天气怎么样？")]},
+            config=config,
+        )
+
+        delegation = graph.get_state(config).values["delegations"][0]
+        self.assertEqual(delegation["result"]["status"], "failed")
+        self.assertEqual(
+            delegation["result"]["summary"],
+            "专业 Agent 达到执行上限",
         )
 
     def test_supervisor_answers_greeting_without_handoff(self) -> None:
@@ -624,7 +815,7 @@ class SupervisorTests(unittest.TestCase):
             config=config,
         )
 
-        self.assertEqual(graph.get_state(config).values["delegation_count"], 0)
+        self.assertEqual(graph.get_state(config).values["delegations"], [])
         self.assertIn("你好", result["messages"][-1].content)
 
     def test_supervisor_enforces_three_delegation_limit(self) -> None:
@@ -671,9 +862,11 @@ class SupervisorTests(unittest.TestCase):
         )
         state = graph.get_state(config).values
 
-        self.assertEqual(state["delegation_count"], 3)
-        self.assertEqual(len(state["delegated_agents"]), 3)
-        self.assertNotIn("order_cancellation_agent", state["delegated_agents"])
+        self.assertEqual(len(state["delegations"]), 3)
+        self.assertNotIn(
+            "order_cancellation_agent",
+            [record["agent"] for record in state["delegations"]],
+        )
         self.assertIn("前三项", result["messages"][-1].content)
         denial = next(
             message
@@ -731,7 +924,7 @@ class SupervisorTests(unittest.TestCase):
         )
         state = graph.get_state(config).values
 
-        self.assertEqual(state["delegation_count"], 1)
+        self.assertEqual(len(state["delegations"]), 1)
         denial = next(
             message
             for message in state["messages"]
@@ -790,7 +983,24 @@ class SupervisorTests(unittest.TestCase):
                         }
                     ],
                 ),
-                AIMessage(content="预订成功，订单号 agent-order-1。"),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "SpecialistResult",
+                            "args": {
+                                "agent": "rental_booking_agent",
+                                "status": "success",
+                                "summary": "预订已完成",
+                                "user_facing_answer": "预订成功，订单号 agent-order-1。",
+                                "completed_tasks": ["创建预订"],
+                                "remaining_tasks": [],
+                            },
+                            "id": "booking-result",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
             ]
         )
         booking_agent = build_rental_booking_agent(
@@ -825,6 +1035,21 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(len(db.created), 1)
         self.assertEqual(db.created[0]["user_id"], "supervisor-user")
         self.assertIn("agent-order-1", result["messages"][-1].content)
+        self.assertFalse(
+            any(
+                "13800138000" in str(message.content)
+                for message in supervisor_model.seen_messages
+            )
+        )
+        checkpoint_messages = graph.get_state(config).values["messages"]
+        self.assertTrue(
+            any(
+                "13800138000" in str(message.content)
+                for message in checkpoint_messages
+            )
+        )
+        booking_result = graph.get_state(config).values["delegations"][0]["result"]
+        self.assertEqual(booking_result["status"], "success")
 
 
 if __name__ == "__main__":

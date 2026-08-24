@@ -44,6 +44,7 @@ def build_order_history_agent(
     ]
     return build_specialist_agent(
         name=name,
+        specialist_name="order_history_agent",
         system_prompt=ORDER_HISTORY_PROMPT,
         tools=resolved_tools,
         model_factory=model_factory,

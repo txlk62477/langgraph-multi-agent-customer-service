@@ -70,8 +70,9 @@ def _build_handoff_tool(
         if len(current_calls) != 1:
             return "一次只能委派一个专业 Agent，请重新选择最合适的单个 Agent。"
 
-        count = int(state.get("delegation_count", 0))
-        delegated = list(state.get("delegated_agents", []))
+        delegations = list(state.get("delegations", []))
+        count = len(delegations)
+        delegated = [record["agent"] for record in delegations]
         if count >= MAX_DELEGATIONS:
             return "本轮最多委派3次。请根据已有专业结果直接回答用户。"
         if specialist in delegated:
@@ -97,8 +98,14 @@ def _build_handoff_tool(
                         tool_call_id=tool_call_id,
                     )
                 ],
-                "delegation_count": count + 1,
-                "delegated_agents": [*delegated, specialist],
+                "delegations": [
+                    *delegations,
+                    {
+                        "agent": specialist,
+                        "task": clean_task,
+                        "tool_call_id": tool_call_id,
+                    },
+                ],
             },
         )
 

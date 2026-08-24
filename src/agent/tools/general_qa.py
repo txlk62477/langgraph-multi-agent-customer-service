@@ -21,6 +21,11 @@ PLAYWRIGHT_CALL_LIMIT = 4
 VISION_CALL_LIMIT = 2
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = ".,;:!?，。；：！？、）)]}"
+_ACCESS_CHALLENGE_PATTERN = re.compile(
+    r"(?:人机验证|安全验证|验证码|访问过于频繁|访问受限|access denied|"
+    r"verify (?:you are|that you are) human|captcha|cloudflare ray id)",
+    re.IGNORECASE,
+)
 
 Search = Callable[..., list[dict[str, Any]]]
 PageReader = Callable[..., dict[str, Any]]
@@ -135,6 +140,22 @@ def _reject_unapproved_url(
     return None
 
 
+def _page_access_error(result: Mapping[str, Any]) -> tuple[int | None, str]:
+    """识别浏览器成功渲染但没有取得真实页面内容的访问拦截。"""
+
+    raw_http_status = result.get("http_status")
+    http_status = int(raw_http_status) if isinstance(raw_http_status, int) else None
+    title = str(result.get("title", ""))
+    rendered_text = str(result.get("rendered_text", ""))
+    if _ACCESS_CHALLENGE_PATTERN.search(f"{title}\n{rendered_text[:2_000]}"):
+        return http_status, "网页要求人机验证，未取得可用正文"
+    if http_status is not None and http_status >= 400:
+        return http_status, f"网页返回 HTTP {http_status}"
+    if result.get("browser_status") != "success":
+        return http_status, str(result.get("browser_error") or "网页读取失败")
+    return http_status, ""
+
+
 def build_anysearch_search_tool(*, search: Search = search_anysearch):
     """创建只返回候选来源摘要的搜索工具。"""
 
@@ -212,13 +233,23 @@ def build_playwright_read_page_tool(
                 capture_screenshot=False,
             )
         except Exception as error:
-            return json_result(status="failed", url=cleaned, error=f"{type(error).__name__}: {error}")
+            return json_result(
+                status="failed",
+                url=cleaned,
+                error=f"{type(error).__name__}: {error}",
+            )
         error = str(result.get("browser_error", ""))
+        rendered_text = str(result.get("rendered_text", ""))
+        title = str(result.get("title", ""))
+        http_status, access_error = _page_access_error(result)
+        error = error or access_error
+        success = not access_error
         return json_result(
-            status="success" if result.get("browser_status") == "success" else "failed",
-            title=str(result.get("title", "")),
+            status="success" if success else "failed",
+            title=title,
             url=cleaned,
-            rendered_text=str(result.get("rendered_text", "")),
+            http_status=http_status,
+            rendered_text=rendered_text if success else "",
             json_responses=result.get("json_responses", []),
             error=error,
         )
@@ -258,12 +289,24 @@ def build_analyze_page_visuals_tool(
                 {"title": "", "url": cleaned_url},
                 capture_screenshot=True,
             )
+            http_status, access_error = _page_access_error(page)
+            if access_error:
+                return json_result(
+                    status="failed",
+                    url=cleaned_url,
+                    http_status=http_status,
+                    error=access_error,
+                )
             screenshot = str(page.get("screenshot_base64", ""))
             if page.get("screenshot_status") != "success" or not screenshot:
                 return json_result(
                     status="failed",
                     url=cleaned_url,
-                    error=str(page.get("screenshot_error") or page.get("browser_error") or "网页截图不可用"),
+                    error=str(
+                        page.get("screenshot_error")
+                        or page.get("browser_error")
+                        or "网页截图不可用"
+                    ),
                 )
             evidence = vision_factory().analyze_webpage(
                 query=cleaned_question,

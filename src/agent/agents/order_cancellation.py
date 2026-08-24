@@ -52,6 +52,7 @@ def build_order_cancellation_agent(
     ]
     return build_specialist_agent(
         name=name,
+        specialist_name="order_cancellation_agent",
         system_prompt=ORDER_CANCELLATION_PROMPT,
         tools=resolved_tools,
         model_factory=model_factory,

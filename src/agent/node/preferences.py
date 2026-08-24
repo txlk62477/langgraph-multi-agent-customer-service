@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 import json
 import os
 from typing import Any
@@ -26,6 +27,25 @@ from agent.state.preferences import PreferenceState
 
 
 ModelFactory = Callable[[], Any]
+
+
+@dataclass(frozen=True)
+class _PreferenceDelta:
+    """偏好节点内部的提取结果，不属于 LangGraph 状态接口。"""
+
+    updates: dict[str, Any] = field(default_factory=dict)
+    clear_fields: list[PreferenceField] = field(default_factory=list)
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class _PreferenceSaveResult:
+    """偏好节点内部的 Store 写入结果。"""
+
+    saved: bool
+    user_id: str = ""
+    profile: dict[str, Any] | None = None
+    error: str = ""
 
 
 class PreferenceExtractionDecision(BaseModel):
@@ -153,28 +173,51 @@ class PreferenceUpdateNode:
         """执行完整偏好更新；提取失败时不访问 Store。"""
 
         extraction = self._extract_preference_updates(state)
-        if extraction.get("preference_extraction_error"):
-            return extraction
+        if extraction.error:
+            return {
+                "current_turn_start_message_id": None,
+                "preference_status": _preference_status(
+                    state,
+                    saved=False,
+                    extraction_error=extraction.error,
+                    save_error="",
+                ),
+            }
 
-        combined_state = {**state, **extraction}
-        saved = _save_preferences(combined_state, config, runtime)
-        return {**extraction, **saved}
+        saved = _save_preferences(
+            state,
+            config,
+            runtime,
+            updates=extraction.updates,
+            clear_fields=extraction.clear_fields,
+        )
+        result: dict[str, Any] = {
+            "current_turn_start_message_id": None,
+            "preference_status": _preference_status(
+                state,
+                saved=saved.saved,
+                extraction_error="",
+                save_error=saved.error,
+            ),
+        }
+        if saved.user_id:
+            result["user_id"] = saved.user_id
+        if saved.profile is not None:
+            result["user_preferences"] = saved.profile
+        return result
 
     def _extract_preference_updates(
         self,
         state: PreferenceState,
-    ) -> dict[str, Any]:
-        """分析当前业务轮并在提取完成后清空本轮起点。"""
+    ) -> _PreferenceDelta:
+        """分析当前业务轮并返回仅在节点内部流转的偏好增量。"""
 
         current_turn = _current_turn_messages(
             state.get("messages", []),
             state.get("current_turn_start_message_id"),
         )
         if not current_turn:
-            return {
-                "preference_extraction_error": "",
-                "current_turn_start_message_id": None,
-            }
+            return _PreferenceDelta()
 
         try:
             extraction_model = self._model_factory().with_structured_output(
@@ -201,29 +244,16 @@ class PreferenceUpdateNode:
             if not isinstance(decision, PreferenceExtractionDecision):
                 decision = PreferenceExtractionDecision.model_validate(decision)
             if not decision.rental_related:
-                return {
-                    "preference_extraction_error": "",
-                    "current_turn_start_message_id": None,
-                }
+                return _PreferenceDelta()
 
             updates, clear_fields = _build_preference_delta(
                 stored_preferences=state.get("user_preferences", {}),
-                pending_updates=state.get("preference_updates", {}),
-                pending_clear_fields=state.get("preference_clear_fields", []),
                 decision=decision,
             )
-            return {
-                "preference_updates": updates,
-                "preference_clear_fields": clear_fields,
-                "preference_extraction_error": "",
-                "current_turn_start_message_id": None,
-            }
+            return _PreferenceDelta(updates=updates, clear_fields=clear_fields)
         except Exception as error:
             # 偏好属于附加能力；提取失败不得覆盖业务答案或阻断整轮图运行。
-            return {
-                "preference_extraction_error": f"{type(error).__name__}: {error}",
-                "current_turn_start_message_id": None,
-            }
+            return _PreferenceDelta(error=f"{type(error).__name__}: {error}")
 
 
 _PREFERENCE_EXTRACTION_PROMPT = """你是租房客服的用户偏好提取器，不回答用户问题。
@@ -280,7 +310,13 @@ def load_preferences(
     except Exception as error:
         result: dict[str, Any] = {
             "user_preferences": {},
-            "preference_load_error": f"{type(error).__name__}: {error}",
+            "preference_status": {
+                "loaded": False,
+                "saved": False,
+                "load_error": f"{type(error).__name__}: {error}",
+                "extraction_error": "",
+                "save_error": "",
+            },
             **_turn_initial_state(state),
         }
         if user_id:
@@ -289,7 +325,13 @@ def load_preferences(
     return {
         "user_id": user_id,
         "user_preferences": profile,
-        "preference_load_error": "",
+        "preference_status": {
+            "loaded": True,
+            "saved": False,
+            "load_error": "",
+            "extraction_error": "",
+            "save_error": "",
+        },
         **_turn_initial_state(state),
     }
 
@@ -298,22 +340,19 @@ def _save_preferences(
     state: PreferenceState,
     config: RunnableConfig,
     runtime: Runtime[Any],
-) -> dict[str, Any]:
+    *,
+    updates: dict[str, Any],
+    clear_fields: Sequence[PreferenceField],
+) -> _PreferenceSaveResult:
     """把明确的偏好增量合并后保存；仅供 PreferenceUpdateNode 调用。"""
 
-    raw_updates = state.get("preference_updates", {})
-    clear_fields = list(dict.fromkeys(state.get("preference_clear_fields", [])))
+    updates = PreferenceUpdatesModel.model_validate(updates).explicit_updates()
+    clear_fields = list(dict.fromkeys(clear_fields))
     user_id = ""
     try:
-        updates = PreferenceUpdatesModel.model_validate(
-            raw_updates
-        ).explicit_updates()
         if not updates and not clear_fields:
             # 没有新增偏好时不访问 Store，也不改变已有 user_preferences。
-            return {
-                "preferences_saved": False,
-                "preference_save_error": "",
-            }
+            return _PreferenceSaveResult(saved=False)
 
         user_id = _resolve_user_id(state, config)
         if runtime.store is None:
@@ -353,25 +392,17 @@ def _save_preferences(
     except Exception as error:
         # 偏好是增强能力，不应让推荐、预订和订单查询失败。清空本轮增量，
         # 避免同一批坏数据在下一轮被自动重复提交。
-        result = {
-            "preference_updates": {},
-            "preference_clear_fields": [],
-            "preferences_saved": False,
-            "preference_save_error": f"{type(error).__name__}: {error}",
-        }
-        if user_id:
-            result["user_id"] = user_id
-        return result
+        return _PreferenceSaveResult(
+            saved=False,
+            user_id=user_id,
+            error=f"{type(error).__name__}: {error}",
+        )
 
-    return {
-        "user_id": user_id,
-        "user_preferences": profile_value,
-        # 保存成功后清空增量，防止父图后续误把同一批数据再次当作新增内容。
-        "preference_updates": {},
-        "preference_clear_fields": [],
-        "preferences_saved": True,
-        "preference_save_error": "",
-    }
+    return _PreferenceSaveResult(
+        saved=True,
+        user_id=user_id,
+        profile=profile_value,
+    )
 
 
 def _turn_initial_state(state: PreferenceState) -> dict[str, Any]:
@@ -389,13 +420,26 @@ def _turn_initial_state(state: PreferenceState) -> dict[str, Any]:
         "current_turn_start_message_id": (
             latest_human.id if latest_human is not None else None
         ),
-        "delegation_count": 0,
-        "delegated_agents": [],
-        "preference_updates": {},
-        "preference_clear_fields": [],
-        "preference_extraction_error": "",
-        "preferences_saved": False,
-        "preference_save_error": "",
+        "delegations": [],
+    }
+
+
+def _preference_status(
+    state: PreferenceState,
+    *,
+    saved: bool,
+    extraction_error: str,
+    save_error: str,
+) -> dict[str, Any]:
+    """在保留本轮加载结果的同时更新偏好提取与保存诊断。"""
+
+    previous = state.get("preference_status", {})
+    return {
+        "loaded": bool(previous.get("loaded", False)),
+        "saved": saved,
+        "load_error": str(previous.get("load_error", "")),
+        "extraction_error": extraction_error,
+        "save_error": save_error,
     }
 
 
@@ -440,8 +484,6 @@ def _format_current_turn(messages: Sequence[BaseMessage]) -> str:
 def _build_preference_delta(
     *,
     stored_preferences: dict[str, Any],
-    pending_updates: dict[str, Any],
-    pending_clear_fields: Sequence[PreferenceField],
     decision: PreferenceExtractionDecision,
 ) -> tuple[dict[str, Any], list[PreferenceField]]:
     """应用提取操作，返回相对 Store 快照的最小更新与清空字段。"""
@@ -451,13 +493,6 @@ def _build_preference_delta(
         for field in PREFERENCE_FIELDS
     }
     desired = dict(stored)
-
-    # 兼容业务子图已经明确产生的偏好增量，再叠加当前提取结果。
-    for field in pending_clear_fields:
-        desired[field] = None
-    desired.update(
-        PreferenceUpdatesModel.model_validate(pending_updates).explicit_updates()
-    )
 
     old_city = _optional_string(desired.get("city"))
     if decision.city is not None:

@@ -109,6 +109,27 @@ class GeneralQASearchToolTests(unittest.TestCase):
             capture_screenshot=False,
         )
 
+    def test_playwright_rejects_http_error_and_human_verification_pages(self) -> None:
+        url = "https://weather.example.com/protected"
+        page_reader = Mock(
+            return_value={
+                "title": "安全验证",
+                "url": url,
+                "browser_status": "success",
+                "http_status": 403,
+                "rendered_text": "访问过于频繁，请完成人机验证后继续访问。",
+                "json_responses": [],
+                "browser_error": "",
+            }
+        )
+        tool = build_playwright_read_page_tool(page_reader=page_reader)
+
+        result = json.loads(tool.func(url, _runtime([_search_message(url)])))
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["http_status"], 403)
+        self.assertIn("人机验证", result["error"])
+
     def test_page_tools_reject_an_invented_url(self) -> None:
         page_reader = Mock()
         runtime = _runtime([_search_message("https://allowed.example.com")])
@@ -176,6 +197,40 @@ class GeneralQASearchToolTests(unittest.TestCase):
             url="https://dashboard.example.com/prices",
             screenshot_base64="anBlZw==",
         )
+
+    def test_visual_analysis_does_not_call_model_for_a_verification_page(self) -> None:
+        url = "https://dashboard.example.com/protected"
+        page_reader = Mock(
+            return_value={
+                "title": "安全验证",
+                "url": url,
+                "browser_status": "success",
+                "http_status": 403,
+                "rendered_text": "请完成人机验证",
+                "json_responses": [],
+                "browser_error": "",
+                "screenshot_status": "success",
+                "screenshot_base64": "anBlZw==",
+                "screenshot_error": "",
+            }
+        )
+        vision_client = Mock()
+        tool = build_analyze_page_visuals_tool(
+            page_reader=page_reader,
+            vision_factory=lambda: vision_client,
+        )
+
+        result = json.loads(
+            tool.func(
+                url,
+                "看板显示了什么？",
+                _runtime([HumanMessage(content=f"请分析 {url}")]),
+            )
+        )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("人机验证", result["error"])
+        vision_client.analyze_webpage.assert_not_called()
 
     def test_each_tool_enforces_its_per_turn_budget(self) -> None:
         search = Mock(return_value=[])

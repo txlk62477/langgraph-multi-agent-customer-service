@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Literal
+from typing import Any, Literal, NotRequired
 from uuid import uuid4
 
 from langchain.agents.middleware.types import AgentMiddleware, AgentState
@@ -13,22 +13,16 @@ from langgraph.runtime import Runtime
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from agent.tools.runtime import SpecialistContext
+from agent.state.customer_service import MissingField, UserInputGuardEvent
 
 
-MissingField = Literal[
-    "city",
-    "districts",
-    "budget_min",
-    "budget_max",
-    "room_types",
-    "rental_mode",
-    "house_id",
-    "phone",
-    "check_in_date",
-    "check_out_date",
-    "order_no",
-]
 GuardResult = Literal["request", "terminal", "ambiguous"]
+
+
+class UserInputGuardState(AgentState[Any]):
+    """Guard 中间件向专业 Agent 状态增加的诊断字段。"""
+
+    last_guard_event: NotRequired[UserInputGuardEvent]
 
 
 class UserInputDecision(BaseModel):
@@ -57,7 +51,7 @@ class UserInputDecision(BaseModel):
 
 
 class UserInputGuardMiddleware(
-    AgentMiddleware[AgentState[Any], SpecialistContext, Any]
+    AgentMiddleware[UserInputGuardState, SpecialistContext, Any]
 ):
     """使用硬规则和结构化 LLM，阻止 Agent 用普通文本等待用户。
 
@@ -68,20 +62,24 @@ class UserInputGuardMiddleware(
     调度工具、产生 interrupt，并在恢复后继续原有执行流程。
     """
 
+    state_schema = UserInputGuardState
+
     def __init__(self, *, classifier_model: Any, agent_role: str) -> None:
         self._agent_role = agent_role.strip()
+        self._classifier_error = ""
         try:
             self._classifier = classifier_model.with_structured_output(
                 UserInputDecision,
                 method="function_calling",
             )
-        except Exception:
+        except Exception as error:
             # 部分测试模型或临时模型不支持结构化输出；硬规则仍可正常工作。
             self._classifier = None
+            self._classifier_error = f"{type(error).__name__}: {error}"
 
     def after_model(
         self,
-        state: AgentState[Any],
+        state: UserInputGuardState,
         runtime: Runtime[SpecialistContext],
     ) -> dict[str, Any] | None:
         """必要时把最新普通 AI 提问替换为 request_user_input 调用。"""
@@ -103,17 +101,51 @@ class UserInputGuardMiddleware(
         # 这样既降低额外模型调用次数，也避免仅凭问号误判普通结束语。
         hard_result = _hard_rule_result(question)
         if hard_result == "terminal":
-            return None
+            return {
+                "last_guard_event": _guard_event(
+                    message,
+                    result="terminal",
+                    source="hard_rule",
+                    requires_user_input=False,
+                    reason="硬规则识别为任务结束回复",
+                )
+            }
 
         fields = _extract_missing_fields(question)
         reason = "模型回复明确要求用户补充、选择或确认信息"
+        source: Literal["hard_rule", "llm", "fallback"] = "hard_rule"
+        error = ""
         if hard_result == "ambiguous":
-            decision = self._classify(messages[:-1], question)
-            # 分类器不可用、调用失败或判断无需回复时保持原消息不变。
-            if decision is None or not decision.requires_user_input:
-                return None
-            fields = decision.missing_fields or fields
-            reason = decision.reason or "完成当前任务需要用户回复"
+            decision, error = self._classify(messages[:-1], question)
+            if decision is None:
+                source = "fallback"
+                if not fields:
+                    return {
+                        "last_guard_event": _guard_event(
+                            message,
+                            result="pass",
+                            source=source,
+                            requires_user_input=False,
+                            reason="分类器失败且没有识别出明确缺失字段",
+                            error=error,
+                        )
+                    }
+                reason = "分类器失败，但已识别出明确缺失字段"
+            elif not decision.requires_user_input:
+                return {
+                    "last_guard_event": _guard_event(
+                        message,
+                        result="pass",
+                        source="llm",
+                        requires_user_input=False,
+                        missing_fields=decision.missing_fields,
+                        reason=decision.reason or "分类器判断无需等待用户回复",
+                    )
+                }
+            else:
+                source = "llm"
+                fields = decision.missing_fields or fields
+                reason = decision.reason or "完成当前任务需要用户回复"
 
         # 工具参数保留模型原始问题，interrupt 后 Studio 可以直接展示它；
         # missing_fields 则给恢复端提供结构化的待补充字段信息。
@@ -140,17 +172,28 @@ class UserInputGuardMiddleware(
         )
         # 返回消息更新后，Agent 内置的 ToolNode 会调度 request_user_input；
         # interrupt 发生在工具内部，而不是发生在这个 after_model 钩子中。
-        return {"messages": [guarded_message]}
+        return {
+            "messages": [guarded_message],
+            "last_guard_event": _guard_event(
+                message,
+                result="request",
+                source=source,
+                requires_user_input=True,
+                missing_fields=fields,
+                reason=reason,
+                error=error,
+            ),
+        }
 
     def _classify(
         self,
         previous_messages: list[BaseMessage],
         response: str,
-    ) -> UserInputDecision | None:
-        """只在硬规则不确定时分类；任何异常均 fail-open。"""
+    ) -> tuple[UserInputDecision | None, str]:
+        """只在硬规则不确定时分类，并把失败原因交给 checkpoint 诊断。"""
 
         if self._classifier is None:
-            return None
+            return None, self._classifier_error or "分类器不支持结构化输出"
         try:
             result = self._classifier.invoke(
                 [
@@ -167,10 +210,33 @@ class UserInputGuardMiddleware(
                 ]
             )
             if isinstance(result, UserInputDecision):
-                return result
-            return UserInputDecision.model_validate(result)
-        except Exception:
-            return None
+                return result, ""
+            return UserInputDecision.model_validate(result), ""
+        except Exception as error:
+            return None, f"{type(error).__name__}: {error}"
+
+
+def _guard_event(
+    message: AIMessage,
+    *,
+    result: Literal["request", "terminal", "pass"],
+    source: Literal["hard_rule", "llm", "fallback"],
+    requires_user_input: bool,
+    reason: str,
+    missing_fields: list[MissingField] | None = None,
+    error: str = "",
+) -> UserInputGuardEvent:
+    """构造可直接写入 JSON checkpoint 的最新 Guard 诊断。"""
+
+    return {
+        "message_id": message.id,
+        "result": result,
+        "source": source,
+        "requires_user_input": requires_user_input,
+        "missing_fields": list(missing_fields or []),
+        "reason": reason,
+        "error": error,
+    }
 
 
 _CLASSIFIER_PROMPT = """你是专业 Agent 的用户输入等待判定器，不回答业务问题。

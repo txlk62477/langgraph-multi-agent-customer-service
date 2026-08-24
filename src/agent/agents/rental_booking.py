@@ -52,6 +52,7 @@ def build_rental_booking_agent(
     ]
     return build_specialist_agent(
         name=name,
+        specialist_name="rental_booking_agent",
         system_prompt=RENTAL_BOOKING_PROMPT,
         tools=resolved_tools,
         model_factory=model_factory,

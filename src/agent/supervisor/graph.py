@@ -30,6 +30,7 @@ from agent.supervisor.handoff import (
     MAX_DELEGATIONS,
     build_handoff_tools,
 )
+from agent.supervisor.context import SupervisorContextProjectionMiddleware
 from agent.tools.runtime import SpecialistContext
 
 
@@ -101,14 +102,20 @@ def build_customer_service_graph(
         raise ValueError("缺少专业 Agent：" + "、".join(sorted(missing)))
 
     supervisor_model = model_factory()
+    supervisor_name = f"{name}_supervisor_agent"
     supervisor_agent = create_agent(
         model=supervisor_model,
         tools=build_handoff_tools(),
         system_prompt=SUPERVISOR_PROMPT,
-        middleware=build_context_middleware(supervisor_model),
+        middleware=[
+            SupervisorContextProjectionMiddleware(
+                supervisor_name=supervisor_name,
+            ),
+            *build_context_middleware(supervisor_model),
+        ],
         state_schema=CustomerServiceState,
         context_schema=SpecialistContext,
-        name=f"{name}_supervisor_agent",
+        name=supervisor_name,
     )
 
     builder = StateGraph(
@@ -124,6 +131,7 @@ def build_customer_service_graph(
     )
     for specialist_name, specialist in resolved_specialists.items():
         builder.add_node(specialist_name, specialist)
+    builder.add_node("collect_specialist_result", _collect_specialist_result)
     builder.add_node("update_preferences", preference_node)
 
     builder.add_edge(START, "load_preferences")
@@ -134,7 +142,8 @@ def build_customer_service_graph(
         {"handoff": END, "complete": "update_preferences"},
     )
     for specialist_name in required:
-        builder.add_edge(specialist_name, "supervisor_agent")
+        builder.add_edge(specialist_name, "collect_specialist_result")
+    builder.add_edge("collect_specialist_result", "supervisor_agent")
     builder.add_edge("update_preferences", END)
     return builder.compile(name=name, store=store, checkpointer=checkpointer)
 
@@ -147,6 +156,36 @@ def _after_supervisor(state: CustomerServiceState) -> str:
         if messages[-1].name in HANDOFF_TOOL_NAMES:
             return "handoff"
     return "complete"
+
+
+def _collect_specialist_result(state: CustomerServiceState) -> dict[str, Any]:
+    """把子图结构化输出归档到对应委派记录后再交回 Supervisor。"""
+
+    raw_result = state.get("structured_response")
+    if not isinstance(raw_result, dict):
+        raise ValueError("专业 Agent 未返回 SpecialistResult")
+    delegations = list(state.get("delegations", []))
+    pending_index = next(
+        (
+            index
+            for index in range(len(delegations) - 1, -1, -1)
+            if "result" not in delegations[index]
+        ),
+        None,
+    )
+    if pending_index is None:
+        raise ValueError("没有等待接收专业结果的 handoff")
+
+    record = dict(delegations[pending_index])
+    result = dict(raw_result)
+    # 路由身份由 handoff 决定，不能信任模型自行填写的 agent 字段。
+    result["agent"] = record["agent"]
+    record["result"] = result
+    delegations[pending_index] = record
+    return {
+        "delegations": delegations,
+        "structured_response": None,
+    }
 
 
 customer_service_graph = build_customer_service_graph()

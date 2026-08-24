@@ -56,6 +56,7 @@ def build_rental_recommendation_agent(
     ]
     return build_specialist_agent(
         name=name,
+        specialist_name="rental_recommendation_agent",
         system_prompt=RENTAL_RECOMMENDATION_PROMPT,
         tools=resolved_tools,
         model_factory=model_factory,

@@ -1,12 +1,10 @@
 """Agent Supervisor 主图使用的公共状态。"""
 
-from typing import Any, Literal, NotRequired
+from typing import Any, Literal, NotRequired, TypedDict
 
-from langchain.agents.middleware.types import AgentState
 from langgraph.graph import MessagesState
 
-from agent.common.preferences import PreferenceField
-from agent.state.preferences import PreferenceUpdates
+from agent.state.preferences import PreferenceState
 
 
 SpecialistName = Literal[
@@ -15,6 +13,19 @@ SpecialistName = Literal[
     "rental_booking_agent",
     "order_history_agent",
     "order_cancellation_agent",
+]
+MissingField = Literal[
+    "city",
+    "districts",
+    "budget_min",
+    "budget_max",
+    "room_types",
+    "rental_mode",
+    "house_id",
+    "phone",
+    "check_in_date",
+    "check_out_date",
+    "order_no",
 ]
 
 
@@ -26,34 +37,47 @@ class CustomerServiceOutput(MessagesState):
     """主图公共输出：合并后的完整对话消息。"""
 
 
-class CustomerServiceState(AgentState):
+class SpecialistResult(TypedDict):
+    """专业 Agent 对 Supervisor 暴露的唯一完成结果。"""
+
+    agent: SpecialistName
+    status: Literal["success", "needs_input", "failed"]
+    summary: str
+    user_facing_answer: str
+    completed_tasks: list[str]
+    remaining_tasks: list[str]
+
+
+class DelegationRecord(TypedDict):
+    """一次 handoff 的任务、工具调用和可选完成结果。"""
+
+    agent: SpecialistName
+    task: str
+    tool_call_id: str
+    result: NotRequired[SpecialistResult]
+
+
+class UserInputGuardEvent(TypedDict):
+    """最近一次普通模型回复的用户输入等待判定。"""
+
+    message_id: str | None
+    result: Literal["request", "terminal", "pass"]
+    source: Literal["hard_rule", "llm", "fallback"]
+    requires_user_input: bool
+    missing_fields: list[MissingField]
+    reason: str
+    error: str
+
+
+class CustomerServiceState(PreferenceState):
     """主图状态；完整消息由 checkpoint 保存，Supervisor 自主委派任务。
 
     专业 Agent 的模型上下文由官方 middleware 在每次模型调用前统一管理。
     """
 
-    # 用户身份：load_preferences 节点按 state → configurable → CHAT_USER_ID
-    # 顺序解析后写入，业务子图（预订/历史订单）直接继承此字段。
-    user_id: NotRequired[str | None]
-
-    # load_preferences 记录的当前轮第一条用户消息 ID。
-    current_turn_start_message_id: NotRequired[str | None]
-
-    # 当前轮已完成的 handoff 数量和目标，工具以此强制限制委派预算。
-    delegation_count: NotRequired[int]
-    delegated_agents: NotRequired[list[SpecialistName]]
-
-    # load_preferences 从 Store 读取的跨Thread长期租房偏好。
-    user_preferences: NotRequired[dict[str, Any]]
-    # update_preferences 在单节点内提取并保存的临时字段增量。
-    preference_updates: NotRequired[PreferenceUpdates]
-    # 当前轮明确要求清除的偏好字段；写入后将其清空。
-    preference_clear_fields: NotRequired[list[PreferenceField]]
-    # 偏好提取失败原因；提取失败不会阻断当前业务回答。
-    preference_extraction_error: NotRequired[str]
-    # update_preferences 是否在当前轮实际写入了偏好变更。
-    preferences_saved: NotRequired[bool]
-    # 偏好写入失败原因；失败时清空本轮增量但不阻断核心业务。
-    preference_save_error: NotRequired[str]
-    # load_preferences 读取 Store 失败的原因；失败时使用空偏好继续执行。
-    preference_load_error: NotRequired[str]
+    # 本轮委派记录同时承担次数限制、重复检测和结果追踪。
+    delegations: NotRequired[list[DelegationRecord]]
+    # 只保存最新 Guard 诊断；完整变化由 checkpoint 历史承担。
+    last_guard_event: NotRequired[UserInputGuardEvent]
+    # 当前专业任务的循环预算；新委派/新用户轮次重置，中断恢复保留。
+    specialist_budget: NotRequired[dict[str, Any]]

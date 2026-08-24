@@ -76,6 +76,7 @@ def build_general_qa_agent(
 ):
     return build_specialist_agent(
         name=name,
+        specialist_name="general_qa_agent",
         system_prompt=GENERAL_QA_PROMPT,
         tools=list(tools) if tools is not None else build_general_qa_search_tools(),
         model_factory=model_factory,
