@@ -7,7 +7,7 @@ from typing import Any
 from langchain.tools import ToolRuntime, tool
 from langgraph.types import interrupt
 
-from agent.tools.runtime import json_result
+from agent.tools.runtime import SpecialistContext, json_result
 
 
 def build_request_user_input_tool():
@@ -18,7 +18,7 @@ def build_request_user_input_tool():
         question: str,
         reason: str,
         missing_fields: list[str] | None = None,
-        runtime: ToolRuntime = None,
+        runtime: ToolRuntime[SpecialistContext] = None,
     ) -> str:
         """缺少必要信息或需要非写操作确认时暂停任务并向用户提问。"""
 

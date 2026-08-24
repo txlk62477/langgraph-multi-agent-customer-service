@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import os
 from typing import Any
 
 import httpx
-from langchain_core.tools import tool
 
 
 ANYSEARCH_SEARCH_URL = "https://api.anysearch.com/v1/search"
@@ -96,17 +94,3 @@ def search_anysearch(
             }
         )
     return normalized
-
-
-@tool("anysearch_web_search")
-def anysearch_web_search(
-    query: str,
-    tag: str | None = None,
-    params: dict[str, Any] | None = None,
-) -> str:
-    """搜索互联网及垂直数据源；普通搜索不要传 tag，垂直搜索才传 tag 和 params。"""
-
-    return json.dumps(
-        search_anysearch(query, tag=tag, params=params),
-        ensure_ascii=False,
-    )

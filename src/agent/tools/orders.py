@@ -1,166 +1,255 @@
-"""订单查询与取消 Agent 使用的业务工具。"""
+"""历史订单与取消 Agent 使用的原子工具。"""
 
 from __future__ import annotations
 
-import os
-import re
 from collections.abc import Callable, Mapping
 from datetime import date
+import re
 from typing import Any
 
-import psycopg
-from psycopg.rows import dict_row
 from langchain.tools import ToolRuntime, tool
 from langgraph.types import interrupt
 
-from agent.common.booking_db import BookingDB, PostgresBookingDB
-from agent.tools.runtime import json_result, resolve_user_id
+from agent.common.booking_db import BookingDB, OrderRecord, PostgresBookingDB
+from agent.tools.runtime import SpecialistContext, json_result, resolve_user_id
+
+
+BookingDBFactory = Callable[[], BookingDB]
+ORDER_STATUSES = {"confirmed", "cancelled"}
 
 
 def build_list_recent_orders_tool(
-    *,
-    booking_db_factory: Callable[[], BookingDB] = PostgresBookingDB,
+    *, booking_db_factory: BookingDBFactory = PostgresBookingDB
 ):
-    """创建按可信用户身份查询历史订单的工具。"""
-
     @tool("list_recent_orders")
-    def list_recent_orders(limit: int, runtime: ToolRuntime) -> str:
+    def list_recent_orders(
+        limit: int,
+        runtime: ToolRuntime[SpecialistContext],
+    ) -> str:
         """查询当前用户最近的订单；数量范围为1到20。"""
 
         try:
-            user_id = resolve_user_id(runtime)
-            safe_limit = max(1, min(int(limit), 20))
             orders = booking_db_factory().list_recent_orders(
-                user_id=user_id,
-                limit=safe_limit,
+                user_id=resolve_user_id(runtime),
+                limit=max(1, min(int(limit), 20)),
             )
             return json_result(
                 status="success" if orders else "empty",
-                orders=[
-                    {
-                        "order_no": order.order_no,
-                        "house_title": order.house_title,
-                        "check_in_date": order.check_in_date,
-                        "check_out_date": order.check_out_date,
-                        "status": order.status,
-                        "price": order.price,
-                    }
-                    for order in orders
-                ],
+                orders=[_public_order(order) for order in orders],
             )
         except Exception as error:
-            return json_result(
-                status="failed",
-                orders=[],
-                error=f"{type(error).__name__}: {error}",
-            )
+            return _failed_orders(error)
 
     return list_recent_orders
 
 
-def _postgres_uri() -> str:
-    uri = os.getenv("POSTGRES_URI", "").strip()
-    if not uri:
-        raise ValueError("缺少 POSTGRES_URI，无法查询订单")
-    return uri
+def build_search_orders_tool(
+    *, booking_db_factory: BookingDBFactory = PostgresBookingDB
+):
+    @tool("search_orders")
+    def search_orders(
+        runtime: ToolRuntime[SpecialistContext],
+        house_title: str | None = None,
+        status: str | None = None,
+        check_in_date_start: str | None = None,
+        check_in_date_end: str | None = None,
+        limit: int = 10,
+    ) -> str:
+        """按房源名称、状态或入住日期范围筛选当前用户的订单。"""
+
+        cleaned_status = (status or "").strip() or None
+        if cleaned_status and cleaned_status not in ORDER_STATUSES:
+            return json_result(status="invalid", orders=[], error="不支持的订单状态")
+        try:
+            if check_in_date_start:
+                date.fromisoformat(check_in_date_start)
+            if check_in_date_end:
+                date.fromisoformat(check_in_date_end)
+            if check_in_date_start and check_in_date_end:
+                if date.fromisoformat(check_in_date_start) > date.fromisoformat(check_in_date_end):
+                    raise ValueError("日期范围起点不能晚于终点")
+            orders = booking_db_factory().search_orders(
+                user_id=resolve_user_id(runtime),
+                house_title=(house_title or "").strip() or None,
+                status=cleaned_status,
+                check_in_date_start=check_in_date_start,
+                check_in_date_end=check_in_date_end,
+                limit=max(1, min(int(limit), 20)),
+            )
+            return json_result(
+                status="success" if orders else "empty",
+                orders=[_public_order(order) for order in orders],
+            )
+        except ValueError as error:
+            return json_result(status="invalid", orders=[], error=str(error))
+        except Exception as error:
+            return _failed_orders(error)
+
+    return search_orders
 
 
-def _find_orders(
-    *,
-    user_id: str,
-    order_no: str | None,
-    house_title: str | None,
-    check_in_date_start: str | None,
-    check_in_date_end: str | None,
-    limit: int,
-) -> list[dict[str, Any]]:
-    clauses = [
-        "user_id = %(user_id)s",
-        "status = 'confirmed'",
-        "check_in_date > CURRENT_DATE",
-    ]
-    params: dict[str, Any] = {"user_id": user_id, "limit": limit}
-    if order_no:
-        clauses.append("order_no = %(order_no)s")
-        params["order_no"] = order_no
-    if house_title:
-        clauses.append("house_title ILIKE %(house_title)s ESCAPE '\\'")
-        escaped = house_title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        params["house_title"] = f"%{escaped}%"
-    if check_in_date_start and check_in_date_end:
-        start = date.fromisoformat(check_in_date_start)
-        end = date.fromisoformat(check_in_date_end)
-        if start > end:
-            raise ValueError("入住日期范围起点不能晚于终点")
-        clauses.extend(
-            [
-                "check_in_date <= %(date_end)s",
-                "check_out_date > %(date_start)s",
-            ]
-        )
-        params.update(date_start=start, date_end=end)
-    sql = f"""
-        SELECT order_no, house_title, check_in_date, check_out_date, status, price
-        FROM booking_order
-        WHERE {' AND '.join(clauses)}
-        ORDER BY created_at DESC
-        LIMIT %(limit)s
-    """
-    with psycopg.connect(_postgres_uri(), row_factory=dict_row) as connection:
-        rows = connection.execute(sql, params).fetchall()
-    return [
-        {
-            "order_no": str(row["order_no"]),
-            "house_title": str(row["house_title"]),
-            "check_in_date": str(row["check_in_date"]),
-            "check_out_date": str(row["check_out_date"]),
-            "status": str(row["status"]),
-            "price": float(row["price"]) if row["price"] is not None else None,
-        }
-        for row in rows
-    ]
+def build_get_order_details_tool(
+    *, booking_db_factory: BookingDBFactory = PostgresBookingDB
+):
+    @tool("get_order_details")
+    def get_order_details(
+        order_no: str,
+        runtime: ToolRuntime[SpecialistContext],
+    ) -> str:
+        """按明确订单号读取当前用户的一笔订单详情。"""
+
+        try:
+            order = booking_db_factory().get_order(
+                user_id=resolve_user_id(runtime),
+                order_no=order_no.strip(),
+            )
+            return json_result(
+                status="success" if order else "not_found",
+                order=_public_order(order) if order else None,
+            )
+        except Exception as error:
+            return json_result(status="failed", order=None, error=_error(error))
+
+    return get_order_details
 
 
 def build_find_cancellable_orders_tool(
-    *,
-    lookup: Callable[..., list[dict[str, Any]]] = _find_orders,
+    *, booking_db_factory: BookingDBFactory = PostgresBookingDB
 ):
-    """创建只返回当前用户未来可取消订单的查询工具。"""
-
     @tool("find_cancellable_orders")
     def find_cancellable_orders(
-        runtime: ToolRuntime,
-        order_no: str | None = None,
+        runtime: ToolRuntime[SpecialistContext],
         house_title: str | None = None,
         check_in_date_start: str | None = None,
         check_in_date_end: str | None = None,
         limit: int = 5,
     ) -> str:
-        """按订单号、房源或入住日期范围查找当前用户可取消的订单。"""
+        """查找当前用户尚未入住且状态为 confirmed 的可取消订单候选。"""
 
         try:
-            orders = lookup(
+            orders = booking_db_factory().search_orders(
                 user_id=resolve_user_id(runtime),
-                order_no=(order_no or "").strip() or None,
                 house_title=(house_title or "").strip() or None,
-                check_in_date_start=check_in_date_start,
+                status="confirmed",
+                check_in_date_start=check_in_date_start or date.today().isoformat(),
                 check_in_date_end=check_in_date_end,
                 limit=max(1, min(int(limit), 5)),
             )
+            eligible = [
+                order
+                for order in orders
+                if date.fromisoformat(order.check_in_date) > date.today()
+            ]
             return json_result(
-                status="success" if orders else "empty",
-                orders=orders,
+                status="success" if eligible else "empty",
+                orders=[_public_order(order) for order in eligible],
             )
-        except psycopg.errors.UndefinedTable:
-            return json_result(status="empty", orders=[])
         except Exception as error:
-            return json_result(
-                status="failed",
-                orders=[],
-                error=f"{type(error).__name__}: {error}",
-            )
+            return _failed_orders(error)
 
     return find_cancellable_orders
+
+
+def build_check_cancellation_eligibility_tool(
+    *, booking_db_factory: BookingDBFactory = PostgresBookingDB
+):
+    @tool("check_cancellation_eligibility")
+    def check_cancellation_eligibility(
+        order_no: str,
+        runtime: ToolRuntime[SpecialistContext],
+    ) -> str:
+        """检查当前用户指定订单是否仍可取消，并返回取消预览。"""
+
+        try:
+            order = booking_db_factory().get_order(
+                user_id=resolve_user_id(runtime),
+                order_no=order_no.strip(),
+            )
+        except Exception as error:
+            return json_result(status="failed", eligible=False, error=_error(error))
+        if order is None:
+            return json_result(status="not_found", eligible=False)
+        reason = _cancellation_reason(order)
+        return json_result(
+            status="success",
+            eligible=reason == "eligible",
+            reason=reason,
+            order=_public_order(order),
+        )
+
+    return check_cancellation_eligibility
+
+
+def build_cancel_order_tool(
+    *, booking_db_factory: BookingDBFactory = PostgresBookingDB
+):
+    @tool("cancel_order")
+    def cancel_order(
+        order_no: str,
+        runtime: ToolRuntime[SpecialistContext],
+    ) -> str:
+        """强制二次确认后，原子软取消当前用户指定的未来订单。"""
+
+        try:
+            user_id = resolve_user_id(runtime)
+            database = booking_db_factory()
+            order = database.get_order(user_id=user_id, order_no=order_no.strip())
+        except Exception as error:
+            return json_result(status="failed", error=_error(error))
+        if order is None:
+            return json_result(status="not_found", error="没有找到该订单")
+        reason = _cancellation_reason(order)
+        if reason != "eligible":
+            return json_result(status=reason, order=_public_order(order))
+
+        answer = interrupt(
+            {
+                "type": "confirm_order_cancellation",
+                "message": (
+                    "请确认是否取消以下订单：\n"
+                    f"订单号：{order.order_no}；房源：{order.house_title}；"
+                    f"入住：{order.check_in_date}；退房：{order.check_out_date}。\n"
+                    "回复“确认取消”后才会执行。"
+                ),
+                "order": _public_order(order),
+            }
+        )
+        if not _confirmed(answer):
+            return json_result(status="cancelled_by_user", order=_public_order(order))
+        try:
+            result = database.cancel_booking(user_id=user_id, order_no=order.order_no)
+        except Exception as error:
+            return json_result(status="failed", error=_error(error))
+        return json_result(
+            status="success" if result.success else result.reason or "failed",
+            order=_public_order(result.order or order),
+        )
+
+    return cancel_order
+
+
+def _cancellation_reason(order: OrderRecord) -> str:
+    if order.status == "cancelled":
+        return "already_cancelled"
+    if order.status != "confirmed":
+        return "not_cancellable"
+    if date.fromisoformat(order.check_in_date) <= date.today():
+        return "already_started"
+    return "eligible"
+
+
+def _public_order(order: OrderRecord) -> dict[str, Any]:
+    return {
+        "order_no": order.order_no,
+        "house_id": order.house_id,
+        "house_title": order.house_title,
+        "check_in_date": order.check_in_date,
+        "check_out_date": order.check_out_date,
+        "status": order.status,
+        "price": order.price,
+        "created_at": order.created_at,
+        "cancelled_at": order.cancelled_at,
+    }
 
 
 def _confirmed(answer: Any) -> bool:
@@ -175,57 +264,9 @@ def _confirmed(answer: Any) -> bool:
     return normalized in {"是", "确认", "确认取消", "取消吧", "yes", "y"}
 
 
-def build_cancel_order_tool(
-    *,
-    booking_db_factory: Callable[[], BookingDB] = PostgresBookingDB,
-    lookup: Callable[..., list[dict[str, Any]]] = _find_orders,
-):
-    """创建内部强制二次确认的订单取消工具。"""
+def _failed_orders(error: Exception) -> str:
+    return json_result(status="failed", orders=[], error=_error(error))
 
-    @tool("cancel_order")
-    def cancel_order(order_no: str, runtime: ToolRuntime) -> str:
-        """在代码级确认后，软取消当前用户指定的未来订单。"""
 
-        try:
-            user_id = resolve_user_id(runtime)
-            matches = lookup(
-                user_id=user_id,
-                order_no=order_no.strip(),
-                house_title=None,
-                check_in_date_start=None,
-                check_in_date_end=None,
-                limit=1,
-            )
-            if not matches:
-                return json_result(status="not_found", error="没有找到可取消的订单")
-            order = matches[0]
-        except Exception as error:
-            return json_result(status="failed", error=f"{type(error).__name__}: {error}")
-
-        answer = interrupt(
-            {
-                "type": "confirm_order_cancellation",
-                "message": (
-                    "请确认是否取消以下订单：\n"
-                    f"订单号：{order['order_no']}；房源：{order['house_title']}；"
-                    f"入住：{order['check_in_date']}；退房：{order['check_out_date']}。\n"
-                    "回复“确认取消”后才会执行。"
-                ),
-                "order": order,
-            }
-        )
-        if not _confirmed(answer):
-            return json_result(status="cancelled_by_user", order=order)
-
-        try:
-            result = booking_db_factory().cancel_booking(
-                user_id=user_id,
-                order_no=str(order["order_no"]),
-            )
-        except Exception as error:
-            return json_result(status="failed", error=f"{type(error).__name__}: {error}")
-        if result.success:
-            return json_result(status="success", order=order)
-        return json_result(status=result.reason or "failed", order=order)
-
-    return cancel_order
+def _error(error: Exception) -> str:
+    return f"{type(error).__name__}: {error}"

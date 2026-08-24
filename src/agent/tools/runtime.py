@@ -4,18 +4,26 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Mapping
+from typing import Any, Mapping, NotRequired, TypedDict
 
 from langchain.tools import ToolRuntime
 
 
-def resolve_user_id(runtime: ToolRuntime) -> str:
+class SpecialistContext(TypedDict):
+    """Agent Server 注入给专业 Agent 和工具的可信运行上下文。"""
+
+    user_id: NotRequired[str]
+
+
+def resolve_user_id(runtime: ToolRuntime[SpecialistContext]) -> str:
     """从可信运行时解析用户身份，不把 user_id 暴露给模型参数。"""
 
     state = runtime.state if isinstance(runtime.state, Mapping) else {}
+    context = runtime.context if isinstance(runtime.context, Mapping) else {}
     configurable = runtime.config.get("configurable", {})
     candidates = (
         state.get("user_id"),
+        context.get("user_id"),
         configurable.get("user_id"),
         os.getenv("CHAT_USER_ID"),
     )

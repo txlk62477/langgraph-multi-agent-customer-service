@@ -1,36 +1,28 @@
 """预订订单的写数据库适配器：参数化 SQL 与可串行化事务。
 
-与只读的 LangChainSQLTools 不同，本模块直接使用 psycopg 连接，
-所有写操作都在一个可串行化事务内完成，防止并发下同一房源在
+本模块直接使用 psycopg 参数绑定，所有写操作都在一个可串行化事务内完成，防止并发下同一房源在
 重叠日期段被重复预订。
 
-房源匹配使用“规范化精确优先、规范化包含兜底”的策略：
-- 精确匹配：去掉标题中所有空白后与用户输入逐字相同；
-- 包含匹配：去掉标题中所有空白后包含用户输入片段；
-- 包含匹配命中多套时返回候选列表，由业务层中断让用户确认，
-  避免静默订到不想要的房源。
+Agent 必须先通过房源目录工具取得明确 house_id；写入事务仍会重新读取该房源并检查
+日期冲突，避免把 Agent 的前置判断当成可信事实。
 """
 
 from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from typing import Any, Protocol
-from unicodedata import normalize as unicode_normalize
 from uuid import uuid4
 
 import psycopg
 from psycopg.rows import dict_row
 
 
-MAX_HOUSE_CANDIDATES = 5
-
-
 @dataclass(frozen=True, slots=True)
 class HouseCandidate:
-    """包含匹配命中的房源候选。"""
+    """事务内锁定的目标房源。"""
 
     house_id: int
     title: str
@@ -39,7 +31,7 @@ class HouseCandidate:
 
 @dataclass(frozen=True, slots=True)
 class BookingCreateResult:
-    """一次预订事务的结果；命中多套候选时 success=False 且携带 candidates。"""
+    """一次预订事务的稳定结果。"""
 
     success: bool
     order_no: str = ""
@@ -47,7 +39,6 @@ class BookingCreateResult:
     house_title: str = ""
     price: float | None = None
     error: str = ""
-    candidates: tuple[HouseCandidate, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,18 +67,18 @@ class OrderRecord:
 
 
 class BookingDB(Protocol):
-    """预订与历史订单子图依赖的最小数据接口，便于测试注入假实现。"""
+    """预订与订单 Agent 工具依赖的数据库接口。"""
 
     def create_booking(
         self,
         *,
-        house_title: str,
+        house_id: int,
         phone: str,
         check_in_date: str,
         check_out_date: str,
         user_id: str,
     ) -> BookingCreateResult:
-        """创建一条订单；房源不存在、日期重叠或多候选时返回失败结果。"""
+        """创建一条订单；房源不存在或日期重叠时返回失败结果。"""
 
     def list_recent_orders(
         self,
@@ -97,6 +88,21 @@ class BookingDB(Protocol):
     ) -> list[OrderRecord]:
         """按创建时间倒序返回指定用户最近的订单，最多 limit 条。"""
 
+    def search_orders(
+        self,
+        *,
+        user_id: str,
+        house_title: str | None,
+        status: str | None,
+        check_in_date_start: str | None,
+        check_in_date_end: str | None,
+        limit: int,
+    ) -> list[OrderRecord]:
+        """在当前用户范围内按结构化条件查询订单。"""
+
+    def get_order(self, *, user_id: str, order_no: str) -> OrderRecord | None:
+        """读取属于当前用户的一笔明确订单。"""
+
     def cancel_booking(
         self,
         *,
@@ -104,13 +110,6 @@ class BookingDB(Protocol):
         order_no: str,
     ) -> BookingCancellationResult:
         """仅软取消属于该用户且尚未入住的 confirmed 订单。"""
-
-
-def normalize_house_title(value: str) -> str:
-    """规范化房源名称：统一全角/半角并去掉所有空白。"""
-
-    normalized = unicode_normalize("NFKC", value)
-    return "".join(ch for ch in normalized if not ch.isspace())
 
 
 def format_price(price: Any) -> str:
@@ -133,11 +132,9 @@ class _BookingRejected(Exception):
     def __init__(
         self,
         reason: str,
-        candidates: tuple[HouseCandidate, ...] = (),
     ) -> None:
         super().__init__(reason)
         self.reason = reason
-        self.candidates = candidates
 
 
 class PostgresBookingDB:
@@ -189,13 +186,13 @@ class PostgresBookingDB:
     def create_booking(
         self,
         *,
-        house_title: str,
+        house_id: int,
         phone: str,
         check_in_date: str,
         check_out_date: str,
         user_id: str,
     ) -> BookingCreateResult:
-        """在单个可串行化事务内完成房源匹配、日期重叠检查和订单插入。"""
+        """在单个可串行化事务内完成房源读取、日期重叠检查和订单插入。"""
 
         self.ensure_schema()
         order_no = str(uuid4())
@@ -205,15 +202,9 @@ class PostgresBookingDB:
             ) as conn:
                 conn.isolation_level = psycopg.IsolationLevel.SERIALIZABLE
                 with conn.transaction():
-                    houses = self._find_houses(conn, house_title)
-                    if not houses:
+                    house = self._get_house(conn, house_id)
+                    if house is None:
                         raise _BookingRejected("该房源不存在")
-                    if len(houses) > 1:
-                        raise _BookingRejected(
-                            "匹配到多套房源，请确认要预订哪一套",
-                            candidates=tuple(houses),
-                        )
-                    house = houses[0]
                     if self._has_date_overlap(
                         conn,
                         house_id=house.house_id,
@@ -253,7 +244,6 @@ class PostgresBookingDB:
             return BookingCreateResult(
                 success=False,
                 error=rejected.reason,
-                candidates=rejected.candidates,
             )
         except psycopg.errors.SerializationFailure:
             return BookingCreateResult(
@@ -317,6 +307,66 @@ class PostgresBookingDB:
             )
             for row in rows
         ]
+
+    def search_orders(
+        self,
+        *,
+        user_id: str,
+        house_title: str | None,
+        status: str | None,
+        check_in_date_start: str | None,
+        check_in_date_end: str | None,
+        limit: int,
+    ) -> list[OrderRecord]:
+        clauses = ["user_id = %(user_id)s"]
+        params: dict[str, Any] = {"user_id": user_id, "limit": limit}
+        if house_title:
+            clauses.append("house_title ILIKE %(house_title)s ESCAPE '\\'")
+            params["house_title"] = f"%{_escape_like(house_title)}%"
+        if status:
+            clauses.append("status = %(status)s")
+            params["status"] = status
+        if check_in_date_start:
+            clauses.append("check_out_date > %(date_start)s")
+            params["date_start"] = date.fromisoformat(check_in_date_start)
+        if check_in_date_end:
+            clauses.append("check_in_date <= %(date_end)s")
+            params["date_end"] = date.fromisoformat(check_in_date_end)
+        try:
+            with psycopg.connect(self._postgres_uri, row_factory=dict_row) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT order_no, house_id, house_title, phone,
+                           check_in_date, check_out_date, status, price,
+                           created_at, cancelled_at
+                    FROM booking_order
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY created_at DESC
+                    LIMIT %(limit)s
+                    """,
+                    params,
+                ).fetchall()
+        except psycopg.errors.UndefinedTable:
+            return []
+        return [_order_record_from_row(row) for row in rows]
+
+    def get_order(self, *, user_id: str, order_no: str) -> OrderRecord | None:
+        try:
+            with psycopg.connect(self._postgres_uri, row_factory=dict_row) as conn:
+                row = conn.execute(
+                    """
+                    SELECT order_no, house_id, house_title, phone,
+                           check_in_date, check_out_date, status, price,
+                           created_at, cancelled_at
+                    FROM booking_order
+                    WHERE user_id = %(user_id)s AND order_no = %(order_no)s
+                    LIMIT 1
+                    """,
+                    {"user_id": user_id, "order_no": order_no},
+                ).fetchone()
+        except psycopg.errors.UndefinedTable:
+            return None
+        return _order_record_from_row(row) if row is not None else None
 
     def cancel_booking(
         self,
@@ -387,55 +437,21 @@ class PostgresBookingDB:
             )
 
     @staticmethod
-    def _find_houses(
+    def _get_house(
         conn: psycopg.Connection,
-        house_title: str,
-        limit: int = MAX_HOUSE_CANDIDATES,
-    ) -> list[HouseCandidate]:
-        """规范化精确匹配优先，失败后规范化包含匹配（最多 limit 条）。
-
-        两侧都去掉所有空白再比较，因此“泊澜地 小区”与“泊澜地小区”、
-        “3室 2厅”与“3室2厅”视为一致；全角字符统一为半角。
-        """
-
-        norm = normalize_house_title(house_title)
+        house_id: int,
+    ) -> HouseCandidate | None:
         row = conn.execute(
-            """
-            SELECT id, title, price FROM house
-            WHERE regexp_replace(title, '\\s', '', 'g') = %(title)s
-            ORDER BY id LIMIT 1
-            """,
-            {"title": norm},
+            "SELECT id, title, price FROM house WHERE id = %(house_id)s LIMIT 1",
+            {"house_id": house_id},
         ).fetchone()
-        if row is not None:
-            return [
-                HouseCandidate(
-                    house_id=row["id"],
-                    title=row["title"],
-                    price=float(row["price"]),
-                )
-            ]
-        if not norm:
-            return []
-
-        pattern = f"%{_escape_like(norm)}%"
-        rows = conn.execute(
-            """
-            SELECT id, title, price FROM house
-            WHERE regexp_replace(title, '\\s', '', 'g') ILIKE %(pattern)s
-            ESCAPE '\\'
-            ORDER BY id LIMIT %(limit)s
-            """,
-            {"pattern": pattern, "limit": limit},
-        ).fetchall()
-        return [
-            HouseCandidate(
-                house_id=row["id"],
-                title=row["title"],
-                price=float(row["price"]),
-            )
-            for row in rows
-        ]
+        if row is None:
+            return None
+        return HouseCandidate(
+            house_id=int(row["id"]),
+            title=str(row["title"]),
+            price=float(row["price"]) if row["price"] is not None else None,
+        )
 
     @staticmethod
     def _has_date_overlap(

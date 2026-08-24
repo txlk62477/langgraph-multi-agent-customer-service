@@ -25,7 +25,6 @@ from __future__ import annotations
 import json
 import os
 import urllib.request
-from ast import literal_eval
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -56,15 +55,11 @@ USER_ID = _env("CHAT_USER_ID", "lk")
 PORT = int(_env("PORT", "8080"))
 DEBUG_GRAPH = os.getenv("DEBUG_GRAPH", "1") != "0"  # 图执行调试日志开关
 
-# 只有这些节点的模型输出是最终给用户的回答。意图识别、信息
-# 提取、SQL 规划等内部 LLM 输出不在白名单中，不会泄露到页面。
+# 只有 Supervisor 的模型输出是最终给用户的回答。专业 Agent 的中间结论
+# 会返回共享上下文，但不直接泄露到页面。
 FINAL_ANSWER_NODES = {
     "agent",
     "model",
-    "generate_direct_answer",
-    "generate_search_failure_answer",
-    "generate_answer",
-    "respond_to_query_result",
 }
 
 # 页面只显示已确认的业务节点。子图包装节点、SQL 内部节点和
@@ -73,76 +68,46 @@ PROGRESS_LABELS = {
     "agent": "专业 Agent 正在处理",
     "model": "专业 Agent 正在处理",
     "load_preferences": "读取您的租房偏好",
-    "prepare_routing_context": "整理当前对话",
-    "identify_intent": "理解您的需求",
-    "prepare_context": "筛选相关对话信息",
-    "decide_search": "判断是否需要联网查询",
-    "generate_direct_answer": "组织回答",
     "anysearch_search": "搜索相关网页",
     "playwright_read_page": "读取网页动态内容",
     "analyze_page_visuals": "分析网页可视信息",
-    "finalize_webpages": "汇总网页证据",
-    "generate_answer": "生成回答",
-    "generate_search_failure_answer": "生成联网失败说明",
-    "extract_current_requirements": "整理当前租房条件",
-    "prefill_from_preferences": "使用已有偏好补全条件",
-    "confirm_prefilled_requirements": "等待确认推荐条件",
-    "evaluate_initial_state": "检查已有信息",
-    "extract_information": "提取您补充的信息",
-    "evaluate_collection": "检查必要信息是否齐全",
-    "ask_for_missing_information": "准备补充信息提示",
-    "prepare_house_query_request": "准备房源查询条件",
-    "generate_sql": "生成查询语句",
-    "execute_query": "查询匹配房源",
-    "respond_to_query_result": "生成房源推荐",
-    "prepare_house_validation": "检查预订信息",
-    "check_house": "确认房源状态",
-    "create_order": "创建预订订单",
-    "prepare_order_query": "准备取消订单查询",
-    "extract_order_filters": "整理取消订单条件",
-    "check_order": "查询可取消订单",
+    "get_rental_preferences": "读取租房偏好",
+    "inspect_rental_market": "了解租房市场",
+    "search_houses": "搜索匹配房源",
+    "get_house_details": "读取房源详情",
+    "find_bookable_houses": "查找预订房源",
+    "check_booking_availability": "检查房源档期",
+    "create_booking": "创建预订订单",
+    "list_recent_orders": "查询最近订单",
+    "search_orders": "筛选历史订单",
+    "get_order_details": "读取订单详情",
+    "find_cancellable_orders": "查找可取消订单",
+    "check_cancellation_eligibility": "检查取消资格",
     "cancel_order": "确认并取消订单",
-    "extract_order_limit": "整理订单查询条件",
-    "query_orders": "查询历史订单",
-    "format_result": "整理处理结果",
+    "request_user_input": "等待您补充或确认",
 }
 
 PROGRESS_DESCRIPTIONS = {
     "agent": "正在理解当前任务并选择合适的业务工具。",
     "model": "正在理解当前任务并选择合适的业务工具。",
     "load_preferences": "正在读取跨会话保存的城市、区域、预算和房型。",
-    "prepare_routing_context": "保留最近的有效对话，用于理解当前问题。",
-    "identify_intent": "判断这是常规问答、房源推荐、预订还是订单查询。",
-    "prepare_context": "从最近对话和相关话题摘要中准备有效上下文。",
-    "decide_search": "检查问题是否依赖实时信息或外部资料。",
-    "generate_direct_answer": "正在根据有效上下文组织最终回答。",
     "anysearch_search": "正在按当前问题搜索相关网页。",
     "playwright_read_page": "正在加载网页并提取动态渲染后的内容。",
     "analyze_page_visuals": "正在识别网页截图中的时间、价格和状态等信息。",
-    "finalize_webpages": "正在整理文本、JSON 和视觉识别证据。",
-    "generate_answer": "正在根据业务处理结果生成最终回答。",
-    "generate_search_failure_answer": "联网结果不足，正在生成安全说明。",
-    "extract_current_requirements": "只从您当前这轮消息中提取租房条件。",
-    "prefill_from_preferences": "只用已保存的偏好补充当前缺少的条件。",
-    "confirm_prefilled_requirements": "请您确认从偏好补全的推荐条件。",
-    "evaluate_initial_state": "检查城市、最低预算和最高预算是否齐全。",
-    "extract_information": "只提取您最新补充的租房信息。",
-    "evaluate_collection": "再次检查必要租房条件是否已齐全。",
-    "ask_for_missing_information": "准备请您补充尚缺少的必要信息。",
-    "prepare_house_query_request": "把已确认条件转成房源查询请求。",
-    "generate_sql": "根据城市、区域和预算生成只读查询语句。",
-    "execute_query": "正在 PostgreSQL 中查询严格匹配的数据。",
-    "respond_to_query_result": "正在根据查询状态生成房源推荐或结果说明。",
-    "prepare_house_validation": "检查房源、手机号和入住日期是否有效。",
-    "check_house": "正在确认目标房源是否存在且可预订。",
-    "create_order": "正在事务中校验日期并创建订单。",
-    "prepare_order_query": "根据订单号、房源或入住时间准备查询条件。",
-    "extract_order_filters": "提取订单号、房源名称或入住时间等可选线索。",
-    "check_order": "正在查询当前用户符合条件且尚未入住的订单。",
+    "get_rental_preferences": "正在读取跨会话保存的租房偏好。",
+    "inspect_rental_market": "正在查看真实区域、房源数量和租金范围。",
+    "search_houses": "正在按已确认条件查询真实房源。",
+    "get_house_details": "正在读取选定房源的地址、楼层和设施。",
+    "find_bookable_houses": "正在按名称或小区查找明确候选。",
+    "check_booking_availability": "正在检查目标日期是否存在预订冲突。",
+    "create_booking": "正在事务中重新校验并创建订单。",
+    "list_recent_orders": "正在查询当前用户最近的订单。",
+    "search_orders": "正在按房源、状态或日期筛选当前用户订单。",
+    "get_order_details": "正在读取当前用户的一笔明确订单。",
+    "find_cancellable_orders": "正在查找当前用户尚未入住的订单。",
+    "check_cancellation_eligibility": "正在检查订单状态、入住时间和取消资格。",
     "cancel_order": "等待您选择并确认，然后安全取消订单。",
-    "format_result": "正在把业务处理结果整理成可读回复。",
-    "extract_order_limit": "识别您想查看的最近订单数量。",
-    "query_orders": "正在查询当前用户的历史订单。",
+    "request_user_input": "需要您补充信息或确认后才能继续。",
 }
 
 
@@ -189,7 +154,7 @@ def _handle_stream_event(event_name: str, raw: str) -> None:
         return
 
     # 开启 stream_subgraphs 后，event 名称形如
-    # updates|recommend_rental:任务ID|database_query:任务ID。
+    # updates|recommend_rental:任务ID|tools:任务ID。
     parts = event_name.split("|") if event_name else ["message"]
     event_type = parts[0]
     namespace = [part.split(":", 1)[0] for part in parts[1:] if part]
@@ -293,6 +258,16 @@ def _event_type(event_name: str) -> str:
     return event_name.split("|", 1)[0]
 
 
+def _event_namespace(event_name: str) -> list[str]:
+    """取得 SSE 事件经过的主图和子图节点名称。"""
+
+    return [
+        part.split(":", 1)[0]
+        for part in event_name.split("|")[1:]
+        if part
+    ]
+
+
 def _message_text(message: object) -> str:
     """从 Agent Server 的消息块中提取纯文本 token。"""
 
@@ -373,6 +348,7 @@ def _fallback_reply(values: dict, interrupt_data: object | None = None) -> str:
             "budget_max": "最高预算", "districts": "区域",
             "room_types": "房型", "rental_mode": "租赁方式",
             "phone": "手机号", "house_title": "房源名称",
+            "house_id": "具体房源", "order_no": "订单号",
             "check_in_date": "入住日期", "check_out_date": "退房日期",
         }
         names = "、".join(labels.get(field, str(field)) for field in missing)
@@ -390,12 +366,6 @@ FIELD_LABELS = {
     "house_title": "房源",
     "check_in_date": "入住日期",
     "check_out_date": "退房日期",
-}
-INTENT_LABELS = {
-    "general_qa": "常规问答",
-    "recommend_rental": "房源推荐",
-    "reserve_rental": "房源预订",
-    "order_history": "订单查询",
 }
 RENTAL_MODE_LABELS = {
     "whole_rent": "整租",
@@ -469,46 +439,6 @@ def _page_data(data: dict) -> dict:
     return {}
 
 
-def _query_result_count(value: object) -> int | None:
-    """尝试统计 SQL 工具返回的原始列表行数，不显示原文。"""
-
-    if isinstance(value, list):
-        return len(value)
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = literal_eval(value)
-    except (SyntaxError, ValueError):
-        # SQLAlchemy 结果常含 Decimal('...')，不能被 literal_eval
-        # 解析。此时只扫描列表顶层元组数，不执行任何文本。
-        if not value.lstrip().startswith("["):
-            return None
-        quote = ""
-        escaped = False
-        tuple_depth = 0
-        rows = 0
-        for character in value:
-            if escaped:
-                escaped = False
-                continue
-            if quote:
-                if character == "\\":
-                    escaped = True
-                elif character == quote:
-                    quote = ""
-                continue
-            if character in {"'", '"'}:
-                quote = character
-            elif character == "(":
-                if tuple_depth == 0:
-                    rows += 1
-                tuple_depth += 1
-            elif character == ")" and tuple_depth:
-                tuple_depth -= 1
-        return rows
-    return len(parsed) if isinstance(parsed, list) else None
-
-
 def _progress_detail(node: str, data: object) -> str:
     """根据节点白名单读取少量安全参数。"""
 
@@ -522,47 +452,6 @@ def _progress_detail(node: str, data: object) -> str:
         )
         if parameters:
             return f"当前条件：{parameters}"
-
-    if node in {
-        "extract_current_requirements",
-        "prepare_house_query_request",
-    }:
-        parameters = _rental_parameters(data)
-        if parameters:
-            return f"当前条件：{parameters}"
-
-    if node == "prefill_from_preferences":
-        parameters = _rental_parameters(data)
-        fields = data.get("prefilled_fields") or []
-        field_text = "、".join(FIELD_LABELS.get(field, str(field)) for field in fields)
-        if parameters and field_text:
-            return f"已补全{field_text}：{parameters}"
-        if field_text:
-            return f"已从偏好补全：{field_text}"
-
-    if node == "prepare_routing_context":
-        messages = data.get("routing_messages")
-        if isinstance(messages, list):
-            return f"已选取最近 {len(messages)} 条有效对话。"
-
-    if node == "identify_intent":
-        intent = INTENT_LABELS.get(str(data.get("customer_intent")))
-        if intent:
-            return f"已识别为：{intent}。"
-
-    if node == "prepare_context":
-        messages = data.get("context_messages")
-        summaries = data.get("relevant_topic_summaries")
-        if isinstance(messages, list):
-            summary_count = len(summaries) if isinstance(summaries, list) else 0
-            return f"已准备 {len(messages)} 条对话、{summary_count} 条相关话题摘要。"
-
-    if node == "decide_search":
-        if data.get("qa_route") == "search":
-            query = str(data.get("search_query") or data.get("query") or "").strip()
-            return f"需要联网，搜索问题：{query}" if query else "需要联网查询最新信息。"
-        if data.get("qa_route") == "direct":
-            return "当前问题不依赖实时信息，可以直接回答。"
 
     if node == "anysearch_search":
         query = str(data.get("query") or "").strip()
@@ -578,51 +467,6 @@ def _progress_detail(node: str, data: object) -> str:
         if title:
             action = "正在读取" if node == "playwright_read_page" else "正在分析"
             return f"{action}：{title[:60]}"
-
-    if node == "finalize_webpages":
-        results = data.get("browser_results")
-        if isinstance(results, list):
-            return f"已汇总 {len(results)} 个网页的文本、JSON 和视觉证据。"
-
-    if node in {"evaluate_initial_state", "evaluate_collection", "extract_information"}:
-        missing = data.get("missing_required_fields")
-        if isinstance(missing, list):
-            if not missing:
-                return "城市、最低预算和最高预算已齐全。"
-            names = "、".join(FIELD_LABELS.get(field, str(field)) for field in missing)
-            return f"尚缺少：{names}。"
-
-    if node == "execute_query":
-        count = _query_result_count(data.get("query_result"))
-        if count is not None:
-            return f"数据库返回 {count} 条匹配记录。"
-        status = data.get("query_status")
-        if status == "empty":
-            return "未找到严格匹配当前条件的记录。"
-        if status == "success":
-            return "数据库查询完成，已获得匹配记录。"
-
-    if node == "extract_order_limit" and data.get("order_limit") is not None:
-        return f"将查看最近 {data['order_limit']} 笔订单。"
-
-    if node == "query_orders":
-        orders = data.get("orders")
-        if isinstance(orders, list):
-            return f"已查到 {len(orders)} 笔历史订单。"
-
-    if node in {"prepare_house_validation", "create_order"}:
-        title = str(data.get("house_title") or "").strip()
-        info = data.get("order_info")
-        if isinstance(info, dict):
-            title = str(info.get("house_title") or title).strip()
-        check_in = str(data.get("check_in_date") or "").strip()
-        check_out = str(data.get("check_out_date") or "").strip()
-        if isinstance(info, dict):
-            check_in = str(info.get("check_in_date") or check_in).strip()
-            check_out = str(info.get("check_out_date") or check_out).strip()
-        details = [value for value in (title, check_in, check_out) if value]
-        if details:
-            return " · ".join(details)
 
     return PROGRESS_DESCRIPTIONS[node]
 
@@ -683,7 +527,10 @@ def iter_chat_events(message: str, thread_id: str | None) -> Iterator[dict]:
         kind = _event_type(event_name)
         if kind in {"messages", "messages-tuple"}:
             chunk, metadata = _message_event_parts(data)
-            if metadata.get("langgraph_node") in FINAL_ANSWER_NODES:
+            if (
+                metadata.get("langgraph_node") in FINAL_ANSWER_NODES
+                and "supervisor_agent" in _event_namespace(event_name)
+            ):
                 token = _message_text(chunk)
                 if token:
                     streamed_answer = True

@@ -88,20 +88,20 @@ class WebChatStreamTests(unittest.TestCase):
         self.assertTrue(payloads[0]["stream_subgraphs"])
         self.assertIn({"type": "token", "text": "正常回答"}, events)
 
-    def test_only_user_facing_llm_nodes_emit_tokens(self) -> None:
-        """SQL 规划等内部 LLM 文本不能发送给浏览器。"""
+    def test_only_supervisor_model_emits_tokens(self) -> None:
+        """专业 Agent 中间结论不能绕过 Supervisor 发送给浏览器。"""
 
         initial = {"values": {"messages": []}, "interrupts": []}
         final = {"values": {"messages": []}, "interrupts": []}
         agent_events = (
-            ("messages|recommend_rental:1|database_query:2", [
-                {"content": "SELECT * FROM house"}, {"langgraph_node": "generate_sql"},
+            ("messages|rental_recommendation_agent:1|model:2", [
+                {"content": "专业 Agent 中间结论"}, {"langgraph_node": "model"},
             ]),
-            ("messages|recommend_rental:1", [
-                {"content": "为您推荐"}, {"langgraph_node": "respond_to_query_result"},
+            ("messages|supervisor_agent:1|model:2", [
+                {"content": "为您推荐"}, {"langgraph_node": "model"},
             ]),
-            ("messages|recommend_rental:1", [
-                {"content": "三套房源"}, {"langgraph_node": "respond_to_query_result"},
+            ("messages|supervisor_agent:1|model:2", [
+                {"content": "三套房源"}, {"langgraph_node": "model"},
             ]),
         )
         with (
@@ -112,7 +112,7 @@ class WebChatStreamTests(unittest.TestCase):
 
         tokens = "".join(event["text"] for event in events if event["type"] == "token")
         self.assertEqual(tokens, "为您推荐三套房源")
-        self.assertNotIn("SELECT", tokens)
+        self.assertNotIn("中间结论", tokens)
 
     def test_progress_uses_chinese_allowlist_without_node_output(self) -> None:
         """进度事件只包含中文描述，不包含 SQL 或原始节点名。"""
@@ -120,7 +120,7 @@ class WebChatStreamTests(unittest.TestCase):
         initial = {"values": {"messages": []}, "interrupts": []}
         final = {"values": {"messages": [{"type": "ai", "content": "完成"}]}, "interrupts": []}
         agent_events = (("tasks", {
-            "name": "generate_sql",
+            "name": "search_houses",
             "error": None,
             "result": {"sql": "SELECT secret"},
         }),)
@@ -131,13 +131,13 @@ class WebChatStreamTests(unittest.TestCase):
             events = list(app.iter_chat_events("推荐", "thread-1"))
 
         progress = next(event for event in events if event["type"] == "progress")
-        self.assertEqual(progress["title"], "生成查询语句")
+        self.assertEqual(progress["title"], "搜索匹配房源")
         self.assertEqual(
             progress["detail"],
-            "根据城市、区域和预算生成只读查询语句。",
+            "正在按已确认条件查询真实房源。",
         )
         self.assertEqual(progress["status"], "completed")
-        self.assertNotIn("generate_sql", str(progress))
+        self.assertNotIn("search_houses", str(progress))
         self.assertNotIn("SELECT", str(progress))
 
     def test_preference_progress_contains_only_safe_business_parameters(self) -> None:
@@ -164,59 +164,28 @@ class WebChatStreamTests(unittest.TestCase):
         )
         self.assertNotIn("lk", str(event))
 
-    def test_query_progress_prefers_confirmed_turn_over_stored_preferences(self) -> None:
-        """查询准备必须展示本轮确认条件，不能退回长期偏好。"""
-
-        event = app._progress_event(
-            "prepare_house_query_request",
-            {
-                "city": "上海",
-                "districts": ["黄浦区"],
-                "budget_min": 1000,
-                "budget_max": 3000,
-                "user_preferences": {
-                    "city": "合肥",
-                    "districts": ["包河区", "肥西", "蜀山"],
-                    "budget_min": 1000,
-                    "budget_max": 3000,
-                },
-            },
-            completed=True,
-        )
-
-        self.assertIn("上海", event["detail"])
-        self.assertIn("黄浦区", event["detail"])
-        self.assertNotIn("合肥", event["detail"])
-        self.assertNotIn("包河区", event["detail"])
-
     def test_confirmed_technical_nodes_are_hidden(self) -> None:
         """包装节点、SQL 内部节点和偏好写入节点不对用户展示。"""
 
         hidden = {
-            "general_qa", "recommend_rental", "reserve_rental",
-            "order_history", "web_search",
-            "process_webpage", "information_collection", "database_query",
-            "initialize_query", "begin_attempt", "check_sql", "reset",
-            "extract_preference_updates", "save_preferences",
+            "supervisor_agent", "general_qa_agent", "rental_recommendation_agent",
+            "rental_booking_agent", "order_history_agent", "order_cancellation_agent",
+            "tools", "SummarizationMiddleware.before_model", "update_preferences",
         }
         self.assertTrue(hidden.isdisjoint(app.PROGRESS_LABELS))
 
-    def test_query_progress_counts_decimal_rows_without_exposing_results(self) -> None:
-        """SQLAlchemy Decimal 结果只转成行数，不返回房源原始数据。"""
+    def test_tool_progress_does_not_expose_raw_results(self) -> None:
+        """Agent 工具进度只显示固定业务说明，不返回工具原始数据。"""
 
         event = app._progress_event(
-            "execute_query",
+            "search_houses",
             {
-                "query_status": "success",
-                "query_result": (
-                    "[('房源A', Decimal('2000.00')), "
-                    "('房源B', Decimal('2300.00'))]"
-                ),
+                "houses": [{"title": "房源A", "price": 2000}],
             },
             completed=True,
         )
 
-        self.assertEqual(event["detail"], "数据库返回 2 条匹配记录。")
+        self.assertEqual(event["detail"], "正在按已确认条件查询真实房源。")
         self.assertNotIn("房源A", str(event))
         self.assertNotIn("Decimal", str(event))
 
@@ -228,14 +197,14 @@ class WebChatStreamTests(unittest.TestCase):
         agent_events = (
             ("tasks", {
                 "id": "task-1",
-                "name": "extract_current_requirements",
+                "name": "search_houses",
                 "input": {
                     "city": "合肥", "districts": ["包河区"],
                     "budget_min": 1000, "budget_max": 4000,
                 },
             }),
             ("tasks", {
-                "name": "extract_current_requirements",
+                "name": "search_houses",
                 "error": None,
                 "result": {
                     "city": "合肥", "districts": ["包河区"],
@@ -253,7 +222,7 @@ class WebChatStreamTests(unittest.TestCase):
         self.assertEqual(progress[0]["status"], "running")
         self.assertNotIn("1000", progress[0]["detail"])
         self.assertEqual(progress[1]["status"], "completed")
-        self.assertIn("预算 2000–4000 元/月", progress[1]["detail"])
+        self.assertEqual(progress[1]["detail"], "正在按已确认条件查询真实房源。")
 
     def test_sse_parser_prints_nested_node_path(self) -> None:
         """标准 SSE event/data 应解析并打印子图节点路径。"""
@@ -268,7 +237,7 @@ class WebChatStreamTests(unittest.TestCase):
             def __iter__(self):
                 return iter([
                     b"event: tasks|recommend_rental:task-1\n",
-                    b'data: {"name":"prepare_house_query_request","input":{}}\n',
+                    b'data: {"name":"search_houses","input":{}}\n',
                     b"\n",
                 ])
 
@@ -281,7 +250,7 @@ class WebChatStreamTests(unittest.TestCase):
             events = list(app._iter_agent_events("http://agent/runs/stream", {}))
 
         self.assertEqual(events[0][0], "tasks|recommend_rental:task-1")
-        self.assertIn("recommend_rental / prepare_house_query_request", output.getvalue())
+        self.assertIn("recommend_rental / search_houses", output.getvalue())
 
     def test_terminal_debug_uses_task_result_instead_of_null_update(self) -> None:
         """公共输出 Schema 过滤 updates 时，终端应显示 tasks 的真实结果。"""

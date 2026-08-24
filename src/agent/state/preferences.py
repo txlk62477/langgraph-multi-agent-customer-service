@@ -25,7 +25,7 @@ class PreferenceState(TypedDict, total=False):
 
     # 正式运行时应由调用方传入 user_id；Studio 调试可回退到 CHAT_USER_ID。
     user_id: str
-    # 偏好提取节点从当前业务流程起点读取全部Human/AI消息。
+    # update_preferences 从当前业务流程起点读取全部 Human/AI 消息。
     messages: NotRequired[list[AnyMessage]]
     # 由主图入口设置，供偏好提取节点确定本轮业务消息的起点。
     current_turn_start_message_id: NotRequired[str | None]

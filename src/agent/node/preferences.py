@@ -1,4 +1,4 @@
-"""用户偏好读取与保存节点。"""
+"""用户偏好读取与原子更新节点。"""
 
 from __future__ import annotations
 
@@ -138,13 +138,29 @@ class PreferenceExtractionDecision(BaseModel):
         return self
 
 
-class PreferenceExtractionNodes:
-    """从当前轮对话提取偏好操作，并与已加载偏好合并。"""
+class PreferenceUpdateNode:
+    """在一个图节点内完成偏好提取、校验和 Store 持久化。"""
 
     def __init__(self, *, model_factory: ModelFactory = build_chat_model) -> None:
         self._model_factory = model_factory
 
-    def extract_preference_updates(
+    def __call__(
+        self,
+        state: PreferenceState,
+        config: RunnableConfig,
+        runtime: Runtime[Any],
+    ) -> dict[str, Any]:
+        """执行完整偏好更新；提取失败时不访问 Store。"""
+
+        extraction = self._extract_preference_updates(state)
+        if extraction.get("preference_extraction_error"):
+            return extraction
+
+        combined_state = {**state, **extraction}
+        saved = _save_preferences(combined_state, config, runtime)
+        return {**extraction, **saved}
+
+    def _extract_preference_updates(
         self,
         state: PreferenceState,
     ) -> dict[str, Any]:
@@ -240,7 +256,7 @@ def load_preferences(
     config: RunnableConfig,
     runtime: Runtime[Any],
 ) -> dict[str, Any]:
-    """从官方 LangGraph Store 读取跨 Thread 用户偏好。"""
+    """读取长期偏好，同时初始化当前轮 handoff 和偏好更新状态。"""
 
     # 先解析身份，再访问 Store。这样即使 Store 暂时不可用，后续核心业务
     # 仍能继承 user_id 创建订单、查询订单或执行推荐。
@@ -265,6 +281,7 @@ def load_preferences(
         result: dict[str, Any] = {
             "user_preferences": {},
             "preference_load_error": f"{type(error).__name__}: {error}",
+            **_turn_initial_state(state),
         }
         if user_id:
             result["user_id"] = user_id
@@ -273,15 +290,16 @@ def load_preferences(
         "user_id": user_id,
         "user_preferences": profile,
         "preference_load_error": "",
+        **_turn_initial_state(state),
     }
 
 
-def save_preferences(
+def _save_preferences(
     state: PreferenceState,
     config: RunnableConfig,
     runtime: Runtime[Any],
 ) -> dict[str, Any]:
-    """把明确的偏好增量合并后保存到官方 LangGraph Store。"""
+    """把明确的偏好增量合并后保存；仅供 PreferenceUpdateNode 调用。"""
 
     raw_updates = state.get("preference_updates", {})
     clear_fields = list(dict.fromkeys(state.get("preference_clear_fields", [])))
@@ -352,6 +370,31 @@ def save_preferences(
         "preference_updates": {},
         "preference_clear_fields": [],
         "preferences_saved": True,
+        "preference_save_error": "",
+    }
+
+
+def _turn_initial_state(state: PreferenceState) -> dict[str, Any]:
+    """找到最新用户消息，并清空上一业务轮的临时状态。"""
+
+    latest_human = next(
+        (
+            message
+            for message in reversed(state.get("messages", []))
+            if isinstance(message, HumanMessage)
+        ),
+        None,
+    )
+    return {
+        "current_turn_start_message_id": (
+            latest_human.id if latest_human is not None else None
+        ),
+        "delegation_count": 0,
+        "delegated_agents": [],
+        "preference_updates": {},
+        "preference_clear_fields": [],
+        "preference_extraction_error": "",
+        "preferences_saved": False,
         "preference_save_error": "",
     }
 

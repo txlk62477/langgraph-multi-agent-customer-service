@@ -1,25 +1,26 @@
-"""房源推荐与预订 Agent 使用的深业务工具。"""
+"""房源推荐和预订 Agent 的原子工具。"""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from datetime import date
-from typing import Any
+import re
 
 from langchain.tools import ToolRuntime, tool
 
 from agent.common.booking_db import BookingDB, PostgresBookingDB
 from agent.common.preferences import PREFERENCE_STORE_KEY, PreferenceProfile, preference_namespace
-from agent.graph.database_query import build_database_query_graph
-from agent.node.rental_booking import PHONE_PATTERN
-from agent.tools.runtime import json_result, resolve_user_id
+from agent.common.rental_catalog import PostgresRentalCatalog, RentalCatalog
+from agent.tools.runtime import SpecialistContext, json_result, resolve_user_id
+
+
+PHONE_PATTERN = re.compile(r"^1[3-9]\d{9}$")
+CatalogFactory = Callable[[], RentalCatalog]
 
 
 def build_get_rental_preferences_tool():
-    """创建读取当前用户长期租房偏好的工具。"""
-
     @tool("get_rental_preferences")
-    def get_rental_preferences(runtime: ToolRuntime) -> str:
+    def get_rental_preferences(runtime: ToolRuntime[SpecialistContext]) -> str:
         """读取当前用户跨会话保存的城市、区域、预算和房型偏好。"""
 
         try:
@@ -34,154 +35,194 @@ def build_get_rental_preferences_tool():
             ).model_dump(mode="json", exclude_none=True, exclude={"user_id"})
             return json_result(status="success", preferences=profile)
         except Exception as error:
-            return json_result(
-                status="unavailable",
-                preferences={},
-                error=f"{type(error).__name__}: {error}",
-            )
+            return json_result(status="unavailable", preferences={}, error=_error(error))
 
     return get_rental_preferences
 
 
-def build_search_houses_tool(
-    *,
-    graph_factory: Callable[[], Any] | None = None,
+def build_inspect_rental_market_tool(
+    *, catalog_factory: CatalogFactory = PostgresRentalCatalog
 ):
-    """创建受限房源查询工具；SQL 细节保持在工具实现内部。"""
+    @tool("inspect_rental_market")
+    def inspect_rental_market(
+        runtime: ToolRuntime[SpecialistContext],
+        city: str | None = None,
+        max_regions: int = 12,
+    ) -> str:
+        """查看可用城市、区域、房源数量和租金范围；条件模糊或无结果时使用。"""
 
-    resolved_graph_factory = graph_factory or (
-        lambda: build_database_query_graph(
-            allowed_tables={"house"},
-            name="rental_recommendation_agent_house_query",
-        )
-    )
-    graph: Any | None = None
+        del runtime
+        try:
+            rows = catalog_factory().inspect_market(
+                city=(city or "").strip() or None,
+                limit=max_regions,
+            )
+            return json_result(status="success" if rows else "empty", markets=rows)
+        except Exception as error:
+            return json_result(status="failed", markets=[], error=_error(error))
 
+    return inspect_rental_market
+
+
+def build_search_houses_tool(
+    *, catalog_factory: CatalogFactory = PostgresRentalCatalog
+):
     @tool("search_houses")
-    async def search_houses(
+    def search_houses(
         city: str,
         budget_min: float,
         budget_max: float,
-        runtime: ToolRuntime,
+        runtime: ToolRuntime[SpecialistContext],
         districts: list[str] | None = None,
         room_types: list[str] | None = None,
         rental_mode: str | None = None,
-        max_rows: int = 5,
+        max_results: int = 5,
     ) -> str:
-        """按城市和月租预算查询房源，可附加区域、房型和租赁方式条件。"""
+        """按城市和预算查询房源，可附加区域、房型和租赁方式条件。"""
 
-        nonlocal graph
+        del runtime
         cleaned_city = city.strip()
         if not cleaned_city:
-            return json_result(status="failed", error="城市不能为空")
+            return json_result(status="invalid", houses=[], error="城市不能为空")
         if budget_min < 0 or budget_max < 0 or budget_min > budget_max:
-            return json_result(status="failed", error="租金预算范围无效")
-        limit = max(1, min(int(max_rows), 10))
-        filters = [
-            f"city_name 完全等于 {cleaned_city}",
-            f"price 在 {budget_min:g} 到 {budget_max:g} 之间",
-        ]
-        if districts:
-            filters.append("region_name 包含以下任一区域：" + "、".join(districts))
-        if room_types:
-            filters.append("house_type 或 rooms 符合以下任一房型：" + "、".join(room_types))
-        if rental_mode:
-            filters.append(f"rent_type 符合租赁方式 {rental_mode}")
-        request = (
-            "查询符合条件的租房房源："
-            + "；".join(filters)
-            + "。只返回 title、price、city_name、region_name、community_name、"
-            "house_type、rent_type、area、floor、all_floor、intro，按价格升序。"
-        )
+            return json_result(status="invalid", houses=[], error="租金预算范围无效")
         try:
-            if graph is None:
-                graph = resolved_graph_factory()
-            result = await graph.ainvoke(
-                {
-                    "query_request": request,
-                    "table_name": "house",
-                    "max_rows": limit,
-                },
-                config=runtime.config,
+            houses = catalog_factory().search_houses(
+                city=cleaned_city,
+                budget_min=budget_min,
+                budget_max=budget_max,
+                districts=_clean_list(districts),
+                room_types=_clean_list(room_types),
+                rental_mode=(rental_mode or "").strip() or None,
+                limit=max_results,
             )
-            return json_result(
-                status=result.get("query_status", "failed"),
-                result=result.get("query_result", ""),
-                error=result.get("query_error", ""),
-            )
+            return json_result(status="success" if houses else "empty", houses=houses)
         except Exception as error:
-            return json_result(
-                status="failed",
-                result="",
-                error=f"{type(error).__name__}: {error}",
-            )
+            return json_result(status="failed", houses=[], error=_error(error))
 
     return search_houses
 
 
-def build_create_booking_tool(
-    *,
-    booking_db_factory: Callable[[], BookingDB] = PostgresBookingDB,
+def build_get_house_details_tool(
+    *, catalog_factory: CatalogFactory = PostgresRentalCatalog
 ):
-    """创建包含输入保护和事务写入的预订工具。"""
+    @tool("get_house_details")
+    def get_house_details(
+        house_id: int,
+        runtime: ToolRuntime[SpecialistContext],
+    ) -> str:
+        """读取某个候选房源的完整详情。house_id 必须来自房源工具结果。"""
 
+        del runtime
+        try:
+            house = catalog_factory().get_house_details(house_id=house_id)
+            return json_result(status="success" if house else "not_found", house=house)
+        except Exception as error:
+            return json_result(status="failed", house=None, error=_error(error))
+
+    return get_house_details
+
+
+def build_find_bookable_houses_tool(
+    *, catalog_factory: CatalogFactory = PostgresRentalCatalog
+):
+    @tool("find_bookable_houses")
+    def find_bookable_houses(
+        query: str,
+        runtime: ToolRuntime[SpecialistContext],
+        max_results: int = 5,
+    ) -> str:
+        """按房源名称或小区查找可用于后续预订的明确候选。"""
+
+        del runtime
+        if not query.strip():
+            return json_result(status="invalid", houses=[], error="查询内容不能为空")
+        try:
+            houses = catalog_factory().find_houses(query=query.strip(), limit=max_results)
+            return json_result(status="success" if houses else "empty", houses=houses)
+        except Exception as error:
+            return json_result(status="failed", houses=[], error=_error(error))
+
+    return find_bookable_houses
+
+
+def build_check_booking_availability_tool(
+    *, catalog_factory: CatalogFactory = PostgresRentalCatalog
+):
+    @tool("check_booking_availability")
+    def check_booking_availability(
+        house_id: int,
+        check_in_date: str,
+        check_out_date: str,
+        runtime: ToolRuntime[SpecialistContext],
+    ) -> str:
+        """检查指定候选房源在目标日期范围内是否可以预订。"""
+
+        del runtime
+        try:
+            result = catalog_factory().check_availability(
+                house_id=house_id,
+                check_in_date=check_in_date,
+                check_out_date=check_out_date,
+            )
+            return json_result(status="success", **result)
+        except Exception as error:
+            return json_result(status="invalid", available=False, error=str(error))
+
+    return check_booking_availability
+
+
+def build_create_booking_tool(
+    *, booking_db_factory: Callable[[], BookingDB] = PostgresBookingDB
+):
     @tool("create_booking")
     def create_booking(
         phone: str,
-        house_title: str,
+        house_id: int,
         check_in_date: str,
         check_out_date: str,
-        runtime: ToolRuntime,
+        runtime: ToolRuntime[SpecialistContext],
     ) -> str:
-        """校验完整预订信息，并为当前用户原子创建租房订单。"""
+        """重新校验全部信息，并为当前用户原子创建指定房源的订单。"""
 
-        cleaned_phone = phone.strip()
-        cleaned_title = house_title.strip()
         try:
             user_id = resolve_user_id(runtime)
-            if not PHONE_PATTERN.fullmatch(cleaned_phone):
+            if not PHONE_PATTERN.fullmatch(phone.strip()):
                 raise ValueError("手机号必须是11位大陆手机号")
-            if not cleaned_title:
-                raise ValueError("房源名称不能为空")
             check_in = date.fromisoformat(check_in_date)
             check_out = date.fromisoformat(check_out_date)
-            if check_in <= date.today():
-                raise ValueError("入住日期必须晚于今天")
-            if check_out <= check_in:
-                raise ValueError("退房日期必须晚于入住日期")
+            if check_in <= date.today() or check_out <= check_in:
+                raise ValueError("预订日期范围无效")
         except Exception as error:
             return json_result(status="invalid", error=str(error))
-
         try:
             result = booking_db_factory().create_booking(
-                house_title=cleaned_title,
-                phone=cleaned_phone,
+                house_id=house_id,
+                phone=phone.strip(),
                 check_in_date=check_in.isoformat(),
                 check_out_date=check_out.isoformat(),
                 user_id=user_id,
             )
         except Exception as error:
-            return json_result(
-                status="failed",
-                error=f"{type(error).__name__}: {error}",
-            )
+            return json_result(status="failed", error=_error(error))
         if result.success:
             return json_result(
                 status="success",
                 order_no=result.order_no,
+                house_id=result.house_id,
                 house_title=result.house_title,
                 check_in_date=check_in.isoformat(),
                 check_out_date=check_out.isoformat(),
                 price=result.price,
             )
-        candidates = [
-            {"house_title": item.title, "price": item.price}
-            for item in result.candidates
-        ]
-        return json_result(
-            status="multiple_candidates" if candidates else "rejected",
-            error=result.error,
-            candidates=candidates,
-        )
+        return json_result(status="rejected", error=result.error)
 
     return create_booking
+
+
+def _clean_list(values: list[str] | None) -> list[str]:
+    return list(dict.fromkeys(value.strip() for value in values or [] if value.strip()))
+
+
+def _error(error: Exception) -> str:
+    return f"{type(error).__name__}: {error}"

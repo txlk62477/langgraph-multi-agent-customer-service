@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 import unittest
 
@@ -21,15 +20,16 @@ from agent.agents import (
     rental_booking_agent,
     rental_recommendation_agent,
 )
+from agent.agents.general_qa import build_general_qa_agent
 from agent.agents.order_cancellation import build_order_cancellation_agent
 from agent.agents.order_history import build_order_history_agent
 from agent.agents.rental_booking import build_rental_booking_agent
+from agent.agents.rental_recommendation import build_rental_recommendation_agent
 from agent.common.booking_db import (
     BookingCancellationResult,
     BookingCreateResult,
     OrderRecord,
 )
-from agent.node.customer_service import CustomerIntentDecision
 from agent.node.preferences import PreferenceExtractionDecision
 from agent.supervisor.graph import build_customer_service_graph
 from agent.tools.conversation import build_request_user_input_tool
@@ -42,6 +42,7 @@ class ScriptedToolModel(BaseChatModel):
     _responses: list[AIMessage] = PrivateAttr()
     _index: int = PrivateAttr(default=0)
     _bound_tool_names: list[str] = PrivateAttr(default_factory=list)
+    _seen_messages: list[Any] = PrivateAttr(default_factory=list)
 
     def __init__(self, responses: list[AIMessage]) -> None:
         super().__init__()
@@ -55,13 +56,18 @@ class ScriptedToolModel(BaseChatModel):
     def bound_tool_names(self) -> list[str]:
         return self._bound_tool_names
 
+    @property
+    def seen_messages(self) -> list[Any]:
+        return self._seen_messages
+
     def bind_tools(self, tools, **kwargs):
         del kwargs
         self._bound_tool_names = [tool.name for tool in tools]
         return self
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-        del messages, stop, run_manager, kwargs
+        del stop, run_manager, kwargs
+        self._seen_messages = list(messages)
         response = self._responses[self._index]
         self._index += 1
         return ChatResult(generations=[ChatGeneration(message=response)])
@@ -78,7 +84,7 @@ class FakeBookingDB:
             success=True,
             order_no="agent-order-1",
             house_id=1,
-            house_title=kwargs["house_title"],
+            house_title="测试公寓",
             price=1800,
         )
 
@@ -96,13 +102,54 @@ class FakeBookingDB:
             )
         ][:limit]
 
+    def search_orders(self, *, user_id: str, limit: int, **kwargs) -> list[OrderRecord]:
+        del user_id, kwargs
+        return self.list_recent_orders(user_id="ignored", limit=limit)
+
+    def get_order(self, *, user_id: str, order_no: str) -> OrderRecord | None:
+        del user_id
+        return OrderRecord(
+            order_no=order_no,
+            house_id=1,
+            house_title="测试公寓",
+            phone="13800138000",
+            check_in_date="2099-09-01",
+            check_out_date="2099-09-02",
+            status="confirmed",
+            price=1800,
+        )
+
     def cancel_booking(self, *, user_id: str, order_no: str):
         self.cancelled.append({"user_id": user_id, "order_no": order_no})
         return BookingCancellationResult(success=True)
 
 
+class FakeRentalCatalog:
+    def find_houses(self, *, query: str, limit: int) -> list[dict[str, Any]]:
+        del query, limit
+        return [
+            {
+                "id": 1,
+                "title": "省心租·新世界路2号楼 1室1厅1卫",
+                "price": 1000,
+                "area": 55,
+            },
+            {
+                "id": 2,
+                "title": "省心租·新世界路2号楼 1室1厅1卫",
+                "price": 1100,
+                "area": 52,
+            },
+        ]
+
+
 class SpecialistAgentTests(unittest.TestCase):
     def test_all_specialists_are_react_tool_loops(self) -> None:
+        guarded = {
+            rental_recommendation_agent.name,
+            rental_booking_agent.name,
+            order_cancellation_agent.name,
+        }
         for graph in (
             general_qa_agent,
             rental_recommendation_agent,
@@ -112,7 +159,94 @@ class SpecialistAgentTests(unittest.TestCase):
         ):
             with self.subTest(agent=graph.name):
                 nodes = set(graph.get_graph().nodes)
-                self.assertEqual(nodes, {"__start__", "model", "tools", "__end__"})
+                expected = {
+                    "__start__",
+                    "SummarizationMiddleware.before_model",
+                    "model",
+                    "tools",
+                    "__end__",
+                }
+                if graph.name in guarded:
+                    expected.add("UserInputGuardMiddleware.after_model")
+                self.assertEqual(nodes, expected)
+
+    def test_general_qa_agent_can_plan_with_three_research_tools(self) -> None:
+        model = ScriptedToolModel([AIMessage(content="无需联网的直接回答。")])
+        graph = build_general_qa_agent(
+            model_factory=lambda: model,
+            name="test_autonomous_general_qa_agent",
+        )
+
+        graph.invoke({"messages": [HumanMessage(content="你好")]})
+        self.assertEqual(
+            model.bound_tool_names,
+            [
+                "anysearch_search",
+                "playwright_read_page",
+                "analyze_page_visuals",
+            ],
+        )
+        prompt = "\n".join(
+            str(message.content)
+            for message in model.seen_messages
+            if isinstance(message.content, str)
+        )
+        for policy in (
+            "自主决定",
+            "交叉验证",
+            "Markdown",
+            "最多调用3次",
+            "最多读取4个",
+            "最多分析2个",
+            "不得用模型记忆猜测",
+        ):
+            with self.subTest(policy=policy):
+                self.assertIn(policy, prompt)
+
+    def test_each_business_agent_exposes_granular_tools(self) -> None:
+        cases = [
+            (
+                build_rental_recommendation_agent,
+                {
+                    "get_rental_preferences",
+                    "inspect_rental_market",
+                    "request_user_input",
+                    "search_houses",
+                    "get_house_details",
+                },
+            ),
+            (
+                build_rental_booking_agent,
+                {
+                    "find_bookable_houses",
+                    "check_booking_availability",
+                    "request_user_input",
+                    "create_booking",
+                },
+            ),
+            (
+                build_order_history_agent,
+                {"list_recent_orders", "search_orders", "get_order_details"},
+            ),
+            (
+                build_order_cancellation_agent,
+                {
+                    "find_cancellable_orders",
+                    "check_cancellation_eligibility",
+                    "request_user_input",
+                    "cancel_order",
+                },
+            ),
+        ]
+        for builder, expected in cases:
+            with self.subTest(builder=builder.__name__):
+                model = ScriptedToolModel([AIMessage(content="完成")])
+                graph = builder(model_factory=lambda: model, name="tool-set-test")
+                graph.invoke(
+                    {"messages": [HumanMessage(content="测试")]},
+                    config={"configurable": {"user_id": "user-1"}},
+                )
+                self.assertEqual(set(model.bound_tool_names), expected)
 
     def test_order_history_agent_uses_runtime_identity_and_tool(self) -> None:
         db = FakeBookingDB()
@@ -195,7 +329,7 @@ class SpecialistAgentTests(unittest.TestCase):
                             "name": "create_booking",
                             "args": {
                                 "phone": "13800138000",
-                                "house_title": "测试公寓",
+                                "house_id": 1,
                                 "check_in_date": "2027-09-01",
                                 "check_out_date": "2027-09-02",
                             },
@@ -227,27 +361,111 @@ class SpecialistAgentTests(unittest.TestCase):
         self.assertEqual(db.created[0]["user_id"], "u-1")
         self.assertIn("agent-order-1", result["messages"][-1].content)
 
+    def test_booking_plain_text_question_is_converted_to_interrupt(self) -> None:
+        """模型忘记调用工具时，用户补充问题仍必须进入 interrupt。"""
+
+        model = ScriptedToolModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "find_bookable_houses",
+                            "args": {
+                                "query": "省心租·新世界路2号楼 1室1厅1卫",
+                                "max_results": 5,
+                            },
+                            "id": "find-two-booking-candidates",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(
+                    content=(
+                        "请问您想预订哪一套？另外，还需要您提供手机号、"
+                        "入住日期和退房日期。"
+                    )
+                ),
+                AIMessage(content="已收到您补充的预订信息。"),
+            ]
+        )
+        graph = build_rental_booking_agent(
+            model_factory=lambda: model,
+            catalog_factory=FakeRentalCatalog,
+            checkpointer=InMemorySaver(),
+            name="booking_plain_question_guard",
+        )
+        config = {
+            "configurable": {
+                "thread_id": "booking-plain-question",
+                "user_id": "booking-user",
+            }
+        }
+
+        result = graph.invoke(
+            {
+                "messages": [
+                    HumanMessage(content="预订省心租·新世界路2号楼 1室1厅1卫")
+                ]
+            },
+            config=config,
+        )
+
+        self.assertIn("__interrupt__", result)
+        payload = result["__interrupt__"][0].value
+        self.assertEqual(payload["type"], "agent_request_user_input")
+        self.assertEqual(
+            payload["missing_required_fields"],
+            ["house_id", "phone", "check_in_date", "check_out_date"],
+        )
+
+        resumed = graph.invoke(
+            Command(resume="选择第1套，13800138000，2027-10-01至2027-10-03"),
+            config=config,
+        )
+        self.assertEqual(resumed["messages"][-1].content, "已收到您补充的预订信息。")
+
+    def test_all_user_input_agents_guard_plain_text_requests(self) -> None:
+        cases = [
+            (
+                build_rental_recommendation_agent,
+                "请提供城市、最低预算和最高预算。",
+                ["city", "budget_min", "budget_max"],
+            ),
+            (
+                build_order_cancellation_agent,
+                "请选择您要取消的具体订单号。",
+                ["order_no"],
+            ),
+        ]
+        for index, (builder, question, expected_fields) in enumerate(cases):
+            with self.subTest(builder=builder.__name__):
+                model = ScriptedToolModel([AIMessage(content=question)])
+                graph = builder(
+                    model_factory=lambda: model,
+                    checkpointer=InMemorySaver(),
+                    name=f"guarded-input-agent-{index}",
+                )
+                result = graph.invoke(
+                    {"messages": [HumanMessage(content="请继续处理")]},
+                    config={
+                        "configurable": {
+                            "thread_id": f"guarded-input-{index}",
+                            "user_id": "guarded-user",
+                        }
+                    },
+                )
+
+                payload = result["__interrupt__"][0].value
+                self.assertEqual(payload["message"], question)
+                self.assertEqual(payload["missing_required_fields"], expected_fields)
+
     def test_cancellation_tool_forces_confirmation_before_write(self) -> None:
         db = FakeBookingDB()
-        lookup_calls: list[dict[str, Any]] = []
-
-        def lookup(**kwargs) -> list[dict[str, Any]]:
-            lookup_calls.append(kwargs)
-            return [
-                {
-                    "order_no": "cancel-order-1",
-                    "house_title": "测试公寓",
-                    "check_in_date": "2027-09-01",
-                    "check_out_date": "2027-09-02",
-                    "status": "confirmed",
-                    "price": 1800,
-                }
-            ]
-
         tools = [
-            build_find_cancellable_orders_tool(lookup=lookup),
+            build_find_cancellable_orders_tool(booking_db_factory=lambda: db),
             build_request_user_input_tool(),
-            build_cancel_order_tool(booking_db_factory=lambda: db, lookup=lookup),
+            build_cancel_order_tool(booking_db_factory=lambda: db),
         ]
         model = ScriptedToolModel(
             [
@@ -296,79 +514,249 @@ class SpecialistAgentTests(unittest.TestCase):
 
         self.assertEqual(db.cancelled, [{"user_id": "u-2", "order_no": "cancel-order-1"}])
         self.assertIn("已取消", result["messages"][-1].content)
-        self.assertTrue(all(call["user_id"] == "u-2" for call in lookup_calls))
 
 
 class SupervisorTests(unittest.TestCase):
-    def test_supervisor_routes_to_one_specialist_and_returns_to_preferences(self) -> None:
-        class StructuredModel:
+    @staticmethod
+    def _preference_model():
+        class PreferenceModel:
             def with_structured_output(self, schema, *, method=None):
                 del method
+                if schema is not PreferenceExtractionDecision:
+                    raise AssertionError(schema)
+                return self
 
-                class Invoker:
-                    def invoke(self, messages):
-                        del messages
-                        if schema is CustomerIntentDecision:
-                            return CustomerIntentDecision(
-                                intent="order_history",
-                                reason="用户要查询订单",
-                            )
-                        if schema is PreferenceExtractionDecision:
-                            return PreferenceExtractionDecision(
-                                rental_related=False,
-                                reason="本轮没有偏好变化",
-                            )
-                        raise AssertionError(f"未处理的结构化模型：{schema}")
+            def invoke(self, messages):
+                del messages
+                return PreferenceExtractionDecision(
+                    rental_related=False,
+                    reason="本轮没有偏好变化",
+                )
 
-                return Invoker()
+        return PreferenceModel()
 
-        def specialist(label: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    @staticmethod
+    def _specialists(**overrides):
+        def specialist(label: str):
             return lambda state: {"messages": [AIMessage(content=label)]}
 
-        specialists = {
-            "general_qa": specialist("general_qa"),
-            "recommend_rental": specialist("recommend_rental"),
-            "reserve_rental": specialist("reserve_rental"),
-            "order_history": specialist("order_history"),
-            "cancel_order": specialist("cancel_order"),
+        defaults = {
+            "general_qa_agent": specialist("常规问答结果"),
+            "rental_recommendation_agent": specialist("房源推荐结果"),
+            "rental_booking_agent": specialist("预订结果"),
+            "order_history_agent": specialist("历史订单结果"),
+            "order_cancellation_agent": specialist("取消结果"),
         }
+        defaults.update(overrides)
+        return defaults
+
+    def test_supervisor_handoffs_then_synthesizes_final_answer(self) -> None:
+        supervisor_model = ScriptedToolModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "delegate_to_order_history",
+                            "args": {"task": "查询当前用户的历史订单"},
+                            "id": "handoff-history",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="您有一笔历史订单。"),
+            ]
+        )
         graph = build_customer_service_graph(
-            model_factory=StructuredModel,
-            specialists=specialists,
+            model_factory=lambda: supervisor_model,
+            preference_model_factory=self._preference_model,
+            specialists=self._specialists(),
             store=InMemoryStore(),
+            checkpointer=InMemorySaver(),
             name="test_supervisor",
         )
-
+        config = {
+            "configurable": {
+                "thread_id": "handoff-supervisor-thread",
+                "user_id": "supervisor-user",
+            }
+        }
         result = graph.invoke(
             {"messages": [HumanMessage(content="查询我的历史订单")]},
-            config={"configurable": {"user_id": "supervisor-user"}},
+            config=config,
+        )
+        state = graph.get_state(config).values
+
+        self.assertEqual(result["messages"][-1].content, "您有一笔历史订单。")
+        self.assertEqual(state["delegation_count"], 1)
+        self.assertEqual(state["delegated_agents"], ["order_history_agent"])
+        self.assertEqual(
+            set(supervisor_model.bound_tool_names),
+            {
+                "delegate_to_general_qa",
+                "delegate_to_rental_recommendation",
+                "delegate_to_rental_booking",
+                "delegate_to_order_history",
+                "delegate_to_order_cancellation",
+            },
         )
 
-        self.assertEqual(result["messages"][-1].content, "order_history")
+    def test_supervisor_answers_greeting_without_handoff(self) -> None:
+        supervisor_model = ScriptedToolModel(
+            [AIMessage(content="你好，我可以协助租房和订单服务。")]
+        )
+        graph = build_customer_service_graph(
+            model_factory=lambda: supervisor_model,
+            preference_model_factory=self._preference_model,
+            specialists=self._specialists(),
+            store=InMemoryStore(),
+            checkpointer=InMemorySaver(),
+            name="test_direct_supervisor",
+        )
+        config = {
+            "configurable": {
+                "thread_id": "direct-supervisor-thread",
+                "user_id": "supervisor-user",
+            }
+        }
+        result = graph.invoke(
+            {"messages": [HumanMessage(content="你好")]},
+            config=config,
+        )
+
+        self.assertEqual(graph.get_state(config).values["delegation_count"], 0)
+        self.assertIn("你好", result["messages"][-1].content)
+
+    def test_supervisor_enforces_three_delegation_limit(self) -> None:
+        handoffs = [
+            ("delegate_to_general_qa", "知识查询", "limit-qa"),
+            ("delegate_to_rental_recommendation", "推荐房源", "limit-rec"),
+            ("delegate_to_order_history", "查询订单", "limit-history"),
+            ("delegate_to_order_cancellation", "取消订单", "limit-cancel"),
+        ]
+        responses = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": tool_name,
+                        "args": {"task": task},
+                        "id": call_id,
+                        "type": "tool_call",
+                    }
+                ],
+            )
+            for tool_name, task, call_id in handoffs
+        ]
+        responses.append(AIMessage(content="已根据前三项专业结果完成回复。"))
+        supervisor_model = ScriptedToolModel(responses)
+        graph = build_customer_service_graph(
+            model_factory=lambda: supervisor_model,
+            preference_model_factory=self._preference_model,
+            specialists=self._specialists(),
+            store=InMemoryStore(),
+            checkpointer=InMemorySaver(),
+            name="test_supervisor_limit",
+        )
+        config = {
+            "configurable": {
+                "thread_id": "supervisor-limit-thread",
+                "user_id": "supervisor-user",
+            }
+        }
+
+        result = graph.invoke(
+            {"messages": [HumanMessage(content="处理四项不同任务")]},
+            config=config,
+        )
+        state = graph.get_state(config).values
+
+        self.assertEqual(state["delegation_count"], 3)
+        self.assertEqual(len(state["delegated_agents"]), 3)
+        self.assertNotIn("order_cancellation_agent", state["delegated_agents"])
+        self.assertIn("前三项", result["messages"][-1].content)
+        denial = next(
+            message
+            for message in state["messages"]
+            if getattr(message, "tool_call_id", None) == "limit-cancel"
+        )
+        self.assertIn("最多委派3次", denial.content)
+
+    def test_supervisor_rejects_repeated_specialist_handoff(self) -> None:
+        supervisor_model = ScriptedToolModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "delegate_to_order_history",
+                            "args": {"task": "第一次查询订单"},
+                            "id": "repeat-first",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "delegate_to_order_history",
+                            "args": {"task": "再次查询相同订单"},
+                            "id": "repeat-second",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="已使用第一次订单查询结果。"),
+            ]
+        )
+        graph = build_customer_service_graph(
+            model_factory=lambda: supervisor_model,
+            preference_model_factory=self._preference_model,
+            specialists=self._specialists(),
+            store=InMemoryStore(),
+            checkpointer=InMemorySaver(),
+            name="test_supervisor_repeat",
+        )
+        config = {
+            "configurable": {
+                "thread_id": "supervisor-repeat-thread",
+                "user_id": "supervisor-user",
+            }
+        }
+
+        graph.invoke(
+            {"messages": [HumanMessage(content="查询订单后再重复查一次")]},
+            config=config,
+        )
+        state = graph.get_state(config).values
+
+        self.assertEqual(state["delegation_count"], 1)
+        denial = next(
+            message
+            for message in state["messages"]
+            if getattr(message, "tool_call_id", None) == "repeat-second"
+        )
+        self.assertIn("已经委派过", denial.content)
 
     def test_supervisor_resume_returns_to_interrupted_specialist(self) -> None:
-        class RouterModel:
-            def with_structured_output(self, schema, *, method=None):
-                del method
-
-                class Invoker:
-                    def invoke(self, messages):
-                        del messages
-                        if schema is CustomerIntentDecision:
-                            return CustomerIntentDecision(
-                                intent="reserve_rental",
-                                reason="用户要预订房源",
-                            )
-                        if schema is PreferenceExtractionDecision:
-                            return PreferenceExtractionDecision(
-                                rental_related=False,
-                                reason="本轮没有偏好变化",
-                            )
-                        raise AssertionError(schema)
-
-                return Invoker()
-
         db = FakeBookingDB()
+        supervisor_model = ScriptedToolModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "delegate_to_rental_booking",
+                            "args": {"task": "预订测试公寓并补齐缺失信息"},
+                            "id": "handoff-booking",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(content="预订已完成，订单号 agent-order-1。"),
+            ]
+        )
         specialist_model = ScriptedToolModel(
             [
                 AIMessage(
@@ -393,7 +781,7 @@ class SupervisorTests(unittest.TestCase):
                             "name": "create_booking",
                             "args": {
                                 "phone": "13800138000",
-                                "house_title": "测试公寓",
+                                "house_id": 1,
                                 "check_in_date": "2027-09-01",
                                 "check_out_date": "2027-09-02",
                             },
@@ -411,20 +799,10 @@ class SupervisorTests(unittest.TestCase):
             name="nested_booking_agent",
         )
 
-        def unused_specialist(state):
-            del state
-            return {"messages": [AIMessage(content="不应调用")]}
-
         graph = build_customer_service_graph(
-            model_factory=RouterModel,
-            preference_model_factory=RouterModel,
-            specialists={
-                "general_qa": unused_specialist,
-                "recommend_rental": unused_specialist,
-                "reserve_rental": booking_agent,
-                "order_history": unused_specialist,
-                "cancel_order": unused_specialist,
-            },
+            model_factory=lambda: supervisor_model,
+            preference_model_factory=self._preference_model,
+            specialists=self._specialists(rental_booking_agent=booking_agent),
             store=InMemoryStore(),
             checkpointer=InMemorySaver(),
             name="test_resumable_supervisor",
