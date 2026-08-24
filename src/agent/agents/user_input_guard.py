@@ -8,7 +8,13 @@ from typing import Any, Literal, NotRequired
 from uuid import uuid4
 
 from langchain.agents.middleware.types import AgentMiddleware, AgentState
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -147,11 +153,11 @@ class UserInputGuardMiddleware(
                 fields = decision.missing_fields or fields
                 reason = decision.reason or "完成当前任务需要用户回复"
 
-        # 工具参数保留模型原始问题，interrupt 后 Studio 可以直接展示它；
+        # selection_reason 是 Guard 对这次工具选择给出的简短依据；
         # missing_fields 则给恢复端提供结构化的待补充字段信息。
         tool_args: dict[str, Any] = {
             "question": question,
-            "reason": reason,
+            "selection_reason": reason.strip()[:100],
         }
         if fields:
             tool_args["missing_fields"] = fields

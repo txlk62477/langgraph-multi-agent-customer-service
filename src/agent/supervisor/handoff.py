@@ -10,6 +10,7 @@ from langchain_core.tools import BaseTool
 from langgraph.types import Command
 
 from agent.state.customer_service import CustomerServiceState, SpecialistName
+from agent.tools.runtime import SelectionReason, json_result
 
 
 MAX_DELEGATIONS = 3
@@ -59,6 +60,7 @@ def _build_handoff_tool(
     @tool(tool_name, description=description)
     def handoff(
         task: str,
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[CustomerServiceState],
         tool_call_id: Annotated[str, InjectedToolCallId],
     ) -> Command | str:
@@ -68,19 +70,38 @@ def _build_handoff_tool(
         messages = list(state.get("messages", []))
         current_calls = _current_handoff_calls(messages)
         if len(current_calls) != 1:
-            return "一次只能委派一个专业 Agent，请重新选择最合适的单个 Agent。"
+            return json_result(
+                status="rejected",
+                selection_reason=selection_reason.strip(),
+                error="一次只能委派一个专业 Agent，请重新选择最合适的单个 Agent。",
+            )
 
         delegations = list(state.get("delegations", []))
         count = len(delegations)
         delegated = [record["agent"] for record in delegations]
         if count >= MAX_DELEGATIONS:
-            return "本轮最多委派3次。请根据已有专业结果直接回答用户。"
+            return json_result(
+                status="rejected",
+                selection_reason=selection_reason.strip(),
+                error="本轮最多委派3次。请根据已有专业结果直接回答用户。",
+            )
         if specialist in delegated:
-            return "本轮已经委派过该专业 Agent。请使用已有结果或直接向用户澄清。"
+            return json_result(
+                status="rejected",
+                selection_reason=selection_reason.strip(),
+                error=(
+                    "本轮已经委派过该专业 Agent。"
+                    "请使用已有结果或直接向用户澄清。"
+                ),
+            )
 
         clean_task = task.strip()
         if not clean_task:
-            return "委派任务不能为空，请说明专业 Agent 需要完成的具体目标。"
+            return json_result(
+                status="rejected",
+                selection_reason=selection_reason.strip(),
+                error="委派任务不能为空，请说明专业 Agent 需要完成的具体目标。",
+            )
 
         return Command(
             graph=Command.PARENT,
@@ -89,10 +110,15 @@ def _build_handoff_tool(
                 "messages": [
                     messages[-1],
                     ToolMessage(
-                        content=(
-                            f"Supervisor 已将任务移交给 {specialist}。\n"
-                            f"明确任务：{clean_task}\n"
-                            "请结合此前共享对话完成任务；完成后把结论交回 Supervisor。"
+                        content=json_result(
+                            status="delegated",
+                            specialist=specialist,
+                            selection_reason=selection_reason.strip(),
+                            task=clean_task,
+                            instruction=(
+                                "请结合此前共享对话完成任务；完成后把结论交回 "
+                                "Supervisor。"
+                            ),
                         ),
                         name=tool_name,
                         tool_call_id=tool_call_id,
@@ -103,6 +129,7 @@ def _build_handoff_tool(
                     {
                         "agent": specialist,
                         "task": clean_task,
+                        "selection_reason": selection_reason.strip(),
                         "tool_call_id": tool_call_id,
                     },
                 ],

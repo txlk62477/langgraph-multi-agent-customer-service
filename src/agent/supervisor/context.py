@@ -94,6 +94,7 @@ def _project_messages(
         payload: dict[str, Any] = {
             "delegated_agent": record["agent"],
             "task": record["task"],
+            "selection_reason": record["selection_reason"],
         }
         if result := record.get("result"):
             payload["result"] = result
@@ -105,4 +106,3 @@ def _project_messages(
             )
         )
     return projected
-

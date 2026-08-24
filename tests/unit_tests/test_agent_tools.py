@@ -60,7 +60,7 @@ class GeneralQASearchToolTests(unittest.TestCase):
         )
         tool = build_anysearch_search_tool(search=search)
 
-        raw_result = tool.func("上海今日天气", 3, _runtime())
+        raw_result = tool.func("上海今日天气", "查询最新天气来源", 3, _runtime())
 
         result = json.loads(raw_result)
         self.assertEqual(result["status"], "success")
@@ -94,6 +94,7 @@ class GeneralQASearchToolTests(unittest.TestCase):
 
         raw_result = tool.func(
             "https://weather.example.com/shanghai",
+            "读取候选来源的天气正文",
             runtime,
         )
 
@@ -124,7 +125,13 @@ class GeneralQASearchToolTests(unittest.TestCase):
         )
         tool = build_playwright_read_page_tool(page_reader=page_reader)
 
-        result = json.loads(tool.func(url, _runtime([_search_message(url)])))
+        result = json.loads(
+            tool.func(
+                url,
+                "读取天气来源正文",
+                _runtime([_search_message(url)]),
+            )
+        )
 
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["http_status"], 403)
@@ -137,12 +144,17 @@ class GeneralQASearchToolTests(unittest.TestCase):
         vision_tool = build_analyze_page_visuals_tool(page_reader=page_reader)
 
         read_result = json.loads(
-            read_tool.func("https://invented.example.com", runtime)
+            read_tool.func(
+                "https://invented.example.com",
+                "尝试读取未经搜索批准的来源",
+                runtime,
+            )
         )
         vision_result = json.loads(
             vision_tool.func(
                 "https://invented.example.com",
                 "页面价格是多少？",
+                "尝试分析未经搜索批准的页面",
                 runtime,
             )
         )
@@ -183,6 +195,7 @@ class GeneralQASearchToolTests(unittest.TestCase):
         raw_result = tool.func(
             "https://dashboard.example.com/prices",
             "当前价格和趋势是什么？",
+            "文本不足，需要读取看板中的价格趋势",
             runtime,
         )
 
@@ -224,6 +237,7 @@ class GeneralQASearchToolTests(unittest.TestCase):
             tool.func(
                 url,
                 "看板显示了什么？",
+                "需要分析受保护看板中的可视内容",
                 _runtime([HumanMessage(content=f"请分析 {url}")]),
             )
         )
@@ -260,15 +274,25 @@ class GeneralQASearchToolTests(unittest.TestCase):
         ]
 
         search_result = json.loads(
-            search_tool.func("继续搜索", 5, _runtime(search_messages))
+            search_tool.func(
+                "继续搜索",
+                "已有来源不足，需要继续搜索",
+                5,
+                _runtime(search_messages),
+            )
         )
         read_result = json.loads(
-            read_tool.func(searched_url, _runtime(read_messages))
+            read_tool.func(
+                searched_url,
+                "需要继续读取网页正文",
+                _runtime(read_messages),
+            )
         )
         vision_result = json.loads(
             vision_tool.func(
                 searched_url,
                 "继续分析",
+                "需要继续分析页面视觉内容",
                 _runtime(vision_messages),
             )
         )
@@ -295,7 +319,14 @@ class GeneralQASearchToolTests(unittest.TestCase):
             HumanMessage(content="第二轮问题"),
         ]
 
-        result = json.loads(tool.func("新的搜索", 5, _runtime(messages)))
+        result = json.loads(
+            tool.func(
+                "新的搜索",
+                "新一轮问题需要新的候选来源",
+                5,
+                _runtime(messages),
+            )
+        )
 
         self.assertEqual(result["status"], "empty")
         search.assert_called_once_with("新的搜索", max_results=5)

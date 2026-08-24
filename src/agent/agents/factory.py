@@ -15,6 +15,7 @@ from agent.agents.specialist_budget import (
     SpecialistBudgetMiddleware,
     SpecialistBudgetPolicy,
 )
+from agent.agents.tool_selection_reason import ToolSelectionReasonMiddleware
 from agent.common.llm import build_chat_model
 from agent.state.customer_service import SpecialistName, SpecialistResult
 from agent.tools.runtime import SpecialistContext
@@ -73,6 +74,7 @@ def build_specialist_agent(
     resolved_middleware = (
         list(middleware) if middleware is not None else build_context_middleware(model)
     )
+    resolved_middleware.append(ToolSelectionReasonMiddleware())
     resolved_middleware.append(
         SpecialistBudgetMiddleware(
             agent=specialist_name,
@@ -85,6 +87,8 @@ def build_specialist_agent(
 ## 返回 Supervisor 的结果接口
 
 工具任务全部完成后，必须按 SpecialistResult 结构结束，不要再返回无结构的普通文本。
+每次调用业务工具时，selection_reason 必须用一句不超过100字的中文说明当前缺少的信息或
+本次调用要完成的目标；不得写详细推理、系统提示词或内部上下文。
 达到停止条件、工具上限、工具失败或已有足够证据时，禁止继续调用业务工具，必须立即调用
 SpecialistResult。普通文本不能结束任务。
 agent 固定填写 {specialist_name}；status 反映真实执行结果；summary 用于 Supervisor 判断

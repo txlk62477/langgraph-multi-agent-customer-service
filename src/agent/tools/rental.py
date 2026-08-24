@@ -11,7 +11,12 @@ from langchain.tools import ToolRuntime, tool
 from agent.common.booking_db import BookingDB, PostgresBookingDB
 from agent.common.preferences import PREFERENCE_STORE_KEY, PreferenceProfile, preference_namespace
 from agent.common.rental_catalog import PostgresRentalCatalog, RentalCatalog
-from agent.tools.runtime import SpecialistContext, json_result, resolve_user_id
+from agent.tools.runtime import (
+    SelectionReason,
+    SpecialistContext,
+    json_result,
+    resolve_user_id,
+)
 
 
 PHONE_PATTERN = re.compile(r"^1[3-9]\d{9}$")
@@ -20,9 +25,13 @@ CatalogFactory = Callable[[], RentalCatalog]
 
 def build_get_rental_preferences_tool():
     @tool("get_rental_preferences")
-    def get_rental_preferences(runtime: ToolRuntime[SpecialistContext]) -> str:
+    def get_rental_preferences(
+        selection_reason: SelectionReason,
+        runtime: ToolRuntime[SpecialistContext],
+    ) -> str:
         """读取当前用户跨会话保存的城市、区域、预算和房型偏好。"""
 
+        del selection_reason
         try:
             user_id = resolve_user_id(runtime)
             if runtime.store is None:
@@ -45,13 +54,14 @@ def build_inspect_rental_market_tool(
 ):
     @tool("inspect_rental_market")
     def inspect_rental_market(
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
         city: str | None = None,
         max_regions: int = 12,
     ) -> str:
         """查看可用城市、区域、房源数量和租金范围；条件模糊或无结果时使用。"""
 
-        del runtime
+        del runtime, selection_reason
         try:
             rows = catalog_factory().inspect_market(
                 city=(city or "").strip() or None,
@@ -72,6 +82,7 @@ def build_search_houses_tool(
         city: str,
         budget_min: float,
         budget_max: float,
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
         districts: list[str] | None = None,
         room_types: list[str] | None = None,
@@ -80,7 +91,7 @@ def build_search_houses_tool(
     ) -> str:
         """按城市和预算查询房源，可附加区域、房型和租赁方式条件。"""
 
-        del runtime
+        del runtime, selection_reason
         cleaned_city = city.strip()
         if not cleaned_city:
             return json_result(status="invalid", houses=[], error="城市不能为空")
@@ -109,11 +120,12 @@ def build_get_house_details_tool(
     @tool("get_house_details")
     def get_house_details(
         house_id: int,
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
     ) -> str:
         """读取某个候选房源的完整详情。house_id 必须来自房源工具结果。"""
 
-        del runtime
+        del runtime, selection_reason
         try:
             house = catalog_factory().get_house_details(house_id=house_id)
             return json_result(status="success" if house else "not_found", house=house)
@@ -129,12 +141,13 @@ def build_find_bookable_houses_tool(
     @tool("find_bookable_houses")
     def find_bookable_houses(
         query: str,
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
         max_results: int = 5,
     ) -> str:
         """按房源名称或小区查找可用于后续预订的明确候选。"""
 
-        del runtime
+        del runtime, selection_reason
         if not query.strip():
             return json_result(status="invalid", houses=[], error="查询内容不能为空")
         try:
@@ -154,11 +167,12 @@ def build_check_booking_availability_tool(
         house_id: int,
         check_in_date: str,
         check_out_date: str,
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
     ) -> str:
         """检查指定候选房源在目标日期范围内是否可以预订。"""
 
-        del runtime
+        del runtime, selection_reason
         try:
             result = catalog_factory().check_availability(
                 house_id=house_id,
@@ -181,10 +195,12 @@ def build_create_booking_tool(
         house_id: int,
         check_in_date: str,
         check_out_date: str,
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
     ) -> str:
         """重新校验全部信息，并为当前用户原子创建指定房源的订单。"""
 
+        del selection_reason
         try:
             user_id = resolve_user_id(runtime)
             if not PHONE_PATTERN.fullmatch(phone.strip()):

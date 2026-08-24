@@ -7,7 +7,7 @@ from typing import Any
 from langchain.tools import ToolRuntime, tool
 from langgraph.types import interrupt
 
-from agent.tools.runtime import SpecialistContext, json_result
+from agent.tools.runtime import SelectionReason, SpecialistContext, json_result
 
 
 def build_request_user_input_tool():
@@ -16,7 +16,7 @@ def build_request_user_input_tool():
     @tool("request_user_input")
     def request_user_input(
         question: str,
-        reason: str,
+        selection_reason: SelectionReason,
         missing_fields: list[str] | None = None,
         runtime: ToolRuntime[SpecialistContext] = None,
     ) -> str:
@@ -26,7 +26,7 @@ def build_request_user_input_tool():
         payload: dict[str, Any] = {
             "type": "agent_request_user_input",
             "message": question.strip(),
-            "reason": reason.strip(),
+            "selection_reason": selection_reason.strip(),
         }
         if missing_fields:
             payload["missing_required_fields"] = list(dict.fromkeys(missing_fields))

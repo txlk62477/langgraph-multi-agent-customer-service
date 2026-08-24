@@ -6,20 +6,29 @@ import json
 import unittest
 
 from langchain.tools import ToolRuntime
+from pydantic import ValidationError
 
 from agent.common.booking_db import BookingCreateResult, OrderRecord
 from agent.tools.orders import (
+    build_cancel_order_tool,
     build_check_cancellation_eligibility_tool,
+    build_find_cancellable_orders_tool,
     build_get_order_details_tool,
+    build_list_recent_orders_tool,
     build_search_orders_tool,
 )
+from agent.tools.conversation import build_request_user_input_tool
+from agent.tools.general_qa import build_general_qa_search_tools
 from agent.tools.rental import (
     build_check_booking_availability_tool,
+    build_create_booking_tool,
     build_find_bookable_houses_tool,
     build_get_house_details_tool,
+    build_get_rental_preferences_tool,
     build_inspect_rental_market_tool,
     build_search_houses_tool,
 )
+from agent.supervisor.handoff import build_handoff_tools
 
 
 def _runtime(user_id: str = "user-1") -> ToolRuntime:
@@ -93,6 +102,45 @@ class FakeOrderDB:
 
 
 class RentalToolTests(unittest.TestCase):
+    def test_all_llm_selected_tools_require_a_selection_reason(self) -> None:
+        specialist_tools = [
+            *build_general_qa_search_tools(),
+            build_get_rental_preferences_tool(),
+            build_inspect_rental_market_tool(),
+            build_search_houses_tool(),
+            build_get_house_details_tool(),
+            build_find_bookable_houses_tool(),
+            build_check_booking_availability_tool(),
+            build_create_booking_tool(),
+            build_list_recent_orders_tool(),
+            build_search_orders_tool(),
+            build_get_order_details_tool(),
+            build_find_cancellable_orders_tool(),
+            build_check_cancellation_eligibility_tool(),
+            build_cancel_order_tool(),
+            build_request_user_input_tool(),
+        ]
+
+        for tool in [*specialist_tools, *build_handoff_tools()]:
+            with self.subTest(tool=tool.name):
+                schema = tool.tool_call_schema.model_json_schema()
+                self.assertIn("selection_reason", schema["properties"])
+                self.assertIn("selection_reason", schema["required"])
+
+        request_schema = build_request_user_input_tool().tool_call_schema.model_json_schema()
+        self.assertNotIn("reason", request_schema["properties"])
+
+        search_tool = build_search_houses_tool()
+        with self.assertRaises(ValidationError):
+            search_tool.tool_call_schema.model_validate(
+                {
+                    "city": "合肥",
+                    "budget_min": 1000,
+                    "budget_max": 3000,
+                    "selection_reason": "   ",
+                }
+            )
+
     def test_agent_sees_business_parameters_but_not_runtime(self) -> None:
         catalog = FakeCatalog()
         tool = build_search_houses_tool(catalog_factory=lambda: catalog)
@@ -102,6 +150,11 @@ class RentalToolTests(unittest.TestCase):
         self.assertIn("city", properties)
         self.assertIn("budget_min", properties)
         self.assertIn("max_results", properties)
+        self.assertIn("selection_reason", properties)
+        self.assertIn(
+            "selection_reason",
+            tool.tool_call_schema.model_json_schema()["required"],
+        )
         self.assertNotIn("runtime", properties)
         self.assertNotIn("user_id", properties)
 
@@ -114,11 +167,25 @@ class RentalToolTests(unittest.TestCase):
             build_get_house_details_tool(catalog_factory=factory),
         ]
 
-        market = json.loads(tools[0].func(_runtime(), "合肥", 8))
-        search = json.loads(
-            tools[1].func("合肥", 1500, 2500, _runtime(), ["蜀山"], None, None, 5)
+        market = json.loads(
+            tools[0].func("需要确认合肥可用区域", _runtime(), "合肥", 8)
         )
-        details = json.loads(tools[2].func(7, _runtime()))
+        search = json.loads(
+            tools[1].func(
+                "合肥",
+                1500,
+                2500,
+                "条件齐全，需要查询真实房源",
+                _runtime(),
+                ["蜀山"],
+                None,
+                None,
+                5,
+            )
+        )
+        details = json.loads(
+            tools[2].func(7, "候选房源需要补充设施详情", _runtime())
+        )
 
         self.assertEqual(market["status"], "success")
         self.assertEqual(search["houses"][0]["id"], 7)
@@ -133,8 +200,18 @@ class RentalToolTests(unittest.TestCase):
         find_tool = build_find_bookable_houses_tool(catalog_factory=factory)
         check_tool = build_check_booking_availability_tool(catalog_factory=factory)
 
-        found = json.loads(find_tool.func("测试公寓", _runtime(), 5))
-        checked = json.loads(check_tool.func(7, "2099-09-01", "2099-09-02", _runtime()))
+        found = json.loads(
+            find_tool.func("测试公寓", "需要定位可预订房源", _runtime(), 5)
+        )
+        checked = json.loads(
+            check_tool.func(
+                7,
+                "2099-09-01",
+                "2099-09-02",
+                "创建订单前需要确认档期",
+                _runtime(),
+            )
+        )
 
         self.assertEqual(found["houses"][0]["id"], 7)
         self.assertTrue(checked["available"])
@@ -150,8 +227,24 @@ class OrderToolTests(unittest.TestCase):
         search_tool = build_search_orders_tool(booking_db_factory=factory)
         detail_tool = build_get_order_details_tool(booking_db_factory=factory)
 
-        searched = json.loads(search_tool.func(_runtime("owner"), "测试", "confirmed", None, None, 5))
-        detailed = json.loads(detail_tool.func("order-1", _runtime("owner")))
+        searched = json.loads(
+            search_tool.func(
+                "需要按房源名称筛选当前用户订单",
+                _runtime("owner"),
+                "测试",
+                "confirmed",
+                None,
+                None,
+                5,
+            )
+        )
+        detailed = json.loads(
+            detail_tool.func(
+                "order-1",
+                "需要读取目标订单详情",
+                _runtime("owner"),
+            )
+        )
 
         self.assertEqual(searched["status"], "success")
         self.assertEqual(detailed["order"]["order_no"], "order-1")
@@ -163,7 +256,13 @@ class OrderToolTests(unittest.TestCase):
             booking_db_factory=lambda: database
         )
 
-        result = json.loads(tool.func("order-1", _runtime("owner")))
+        result = json.loads(
+            tool.func(
+                "order-1",
+                "取消前需要检查订单资格",
+                _runtime("owner"),
+            )
+        )
 
         self.assertTrue(result["eligible"])
         self.assertEqual(database.calls, [

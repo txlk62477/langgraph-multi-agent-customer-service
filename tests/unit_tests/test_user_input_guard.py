@@ -58,6 +58,8 @@ class UserInputGuardTests(unittest.TestCase):
             call["args"]["missing_fields"],
             ["house_id", "phone", "check_in_date"],
         )
+        self.assertIn("selection_reason", call["args"])
+        self.assertNotIn("reason", call["args"])
 
     def test_ambiguous_question_uses_structured_classifier(self) -> None:
         model = ClassifierModel(
@@ -79,7 +81,10 @@ class UserInputGuardTests(unittest.TestCase):
 
         self.assertEqual(model.calls, 1)
         call = result["messages"][0].tool_calls[0]
-        self.assertEqual(call["args"]["reason"], "必须确定候选订单")
+        self.assertEqual(
+            call["args"]["selection_reason"],
+            "必须确定候选订单",
+        )
         self.assertEqual(call["args"]["missing_fields"], ["order_no"])
 
     def test_classifier_false_leaves_ordinary_final_answer_unchanged(self) -> None:
@@ -180,7 +185,10 @@ class UserInputGuardTests(unittest.TestCase):
                         tool_calls=[
                             {
                                 "name": "request_user_input",
-                                "args": {"question": "请选择", "reason": "缺少选择"},
+                                "args": {
+                                    "question": "请选择",
+                                    "selection_reason": "缺少选择",
+                                },
                                 "id": "existing-call",
                                 "type": "tool_call",
                             }

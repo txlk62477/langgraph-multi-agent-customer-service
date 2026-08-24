@@ -13,7 +13,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from agent.common.anysearch import search_anysearch
 from agent.common.browser_reader import read_search_result_sync
 from agent.common.vision import OllamaVisionClient, get_vision_client
-from agent.tools.runtime import SpecialistContext, json_result
+from agent.tools.runtime import SelectionReason, SpecialistContext, json_result
 
 
 ANYSEARCH_CALL_LIMIT = 3
@@ -162,11 +162,13 @@ def build_anysearch_search_tool(*, search: Search = search_anysearch):
     @tool("anysearch_search")
     def anysearch_search(
         query: str,
+        selection_reason: SelectionReason,
         max_results: int = 5,
         runtime: ToolRuntime[SpecialistContext] = None,
     ) -> str:
         """搜索候选网页；返回标题、URL和摘要，不读取网页正文。"""
 
+        del selection_reason
         if runtime is None:
             return json_result(status="failed", error="缺少工具运行时")
         if _budget_reached(runtime, "anysearch_search", ANYSEARCH_CALL_LIMIT):
@@ -214,10 +216,12 @@ def build_playwright_read_page_tool(
     @tool("playwright_read_page")
     def playwright_read_page(
         url: str,
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
     ) -> str:
         """读取已批准URL的渲染正文和JSON响应；不进行视觉分析。"""
 
+        del selection_reason
         if _budget_reached(runtime, "playwright_read_page", PLAYWRIGHT_CALL_LIMIT):
             return json_result(
                 status="limit_reached",
@@ -268,10 +272,12 @@ def build_analyze_page_visuals_tool(
     def analyze_page_visuals(
         url: str,
         question: str,
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
     ) -> str:
         """分析已批准URL顶部截图中的图表、价格、时间、状态等可见事实。"""
 
+        del selection_reason
         if _budget_reached(runtime, "analyze_page_visuals", VISION_CALL_LIMIT):
             return json_result(
                 status="limit_reached",

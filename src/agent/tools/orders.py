@@ -11,7 +11,12 @@ from langchain.tools import ToolRuntime, tool
 from langgraph.types import interrupt
 
 from agent.common.booking_db import BookingDB, OrderRecord, PostgresBookingDB
-from agent.tools.runtime import SpecialistContext, json_result, resolve_user_id
+from agent.tools.runtime import (
+    SelectionReason,
+    SpecialistContext,
+    json_result,
+    resolve_user_id,
+)
 
 
 BookingDBFactory = Callable[[], BookingDB]
@@ -24,10 +29,12 @@ def build_list_recent_orders_tool(
     @tool("list_recent_orders")
     def list_recent_orders(
         limit: int,
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
     ) -> str:
         """查询当前用户最近的订单；数量范围为1到20。"""
 
+        del selection_reason
         try:
             orders = booking_db_factory().list_recent_orders(
                 user_id=resolve_user_id(runtime),
@@ -48,6 +55,7 @@ def build_search_orders_tool(
 ):
     @tool("search_orders")
     def search_orders(
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
         house_title: str | None = None,
         status: str | None = None,
@@ -57,6 +65,7 @@ def build_search_orders_tool(
     ) -> str:
         """按房源名称、状态或入住日期范围筛选当前用户的订单。"""
 
+        del selection_reason
         cleaned_status = (status or "").strip() or None
         if cleaned_status and cleaned_status not in ORDER_STATUSES:
             return json_result(status="invalid", orders=[], error="不支持的订单状态")
@@ -94,10 +103,12 @@ def build_get_order_details_tool(
     @tool("get_order_details")
     def get_order_details(
         order_no: str,
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
     ) -> str:
         """按明确订单号读取当前用户的一笔订单详情。"""
 
+        del selection_reason
         try:
             order = booking_db_factory().get_order(
                 user_id=resolve_user_id(runtime),
@@ -118,6 +129,7 @@ def build_find_cancellable_orders_tool(
 ):
     @tool("find_cancellable_orders")
     def find_cancellable_orders(
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
         house_title: str | None = None,
         check_in_date_start: str | None = None,
@@ -126,6 +138,7 @@ def build_find_cancellable_orders_tool(
     ) -> str:
         """查找当前用户尚未入住且状态为 confirmed 的可取消订单候选。"""
 
+        del selection_reason
         try:
             orders = booking_db_factory().search_orders(
                 user_id=resolve_user_id(runtime),
@@ -156,10 +169,12 @@ def build_check_cancellation_eligibility_tool(
     @tool("check_cancellation_eligibility")
     def check_cancellation_eligibility(
         order_no: str,
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
     ) -> str:
         """检查当前用户指定订单是否仍可取消，并返回取消预览。"""
 
+        del selection_reason
         try:
             order = booking_db_factory().get_order(
                 user_id=resolve_user_id(runtime),
@@ -186,10 +201,12 @@ def build_cancel_order_tool(
     @tool("cancel_order")
     def cancel_order(
         order_no: str,
+        selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
     ) -> str:
         """强制二次确认后，原子软取消当前用户指定的未来订单。"""
 
+        del selection_reason
         try:
             user_id = resolve_user_id(runtime)
             database = booking_db_factory()

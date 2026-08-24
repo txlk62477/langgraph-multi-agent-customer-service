@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 import unittest
 
@@ -314,7 +315,10 @@ class SpecialistAgentTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "list_recent_orders",
-                            "args": {"limit": 1},
+                            "args": {
+                                "limit": 1,
+                                "selection_reason": "用户要求查询最近订单",
+                            },
                             "id": "history-call",
                             "type": "tool_call",
                         }
@@ -371,7 +375,7 @@ class SpecialistAgentTests(unittest.TestCase):
                             "name": "request_user_input",
                             "args": {
                                 "question": "请补充手机号",
-                                "reason": "缺少预订信息",
+                                "selection_reason": "缺少预订所需手机号",
                                 "missing_fields": ["phone"],
                             },
                             "id": "ask-phone",
@@ -389,6 +393,7 @@ class SpecialistAgentTests(unittest.TestCase):
                                 "house_id": 1,
                                 "check_in_date": "2027-09-01",
                                 "check_out_date": "2027-09-02",
+                                "selection_reason": "预订信息齐全，可以创建订单",
                             },
                             "id": "create-booking",
                             "type": "tool_call",
@@ -429,6 +434,11 @@ class SpecialistAgentTests(unittest.TestCase):
             config=config,
         )
         self.assertEqual(first["__interrupt__"][0].value["missing_required_fields"], ["phone"])
+        self.assertEqual(
+            first["__interrupt__"][0].value["selection_reason"],
+            "缺少预订所需手机号",
+        )
+        self.assertNotIn("reason", first["__interrupt__"][0].value)
 
         result = graph.invoke(Command(resume="13800138000"), config=config)
 
@@ -460,6 +470,7 @@ class SpecialistAgentTests(unittest.TestCase):
                             "args": {
                                 "query": "省心租·新世界路2号楼 1室1厅1卫",
                                 "max_results": 5,
+                                "selection_reason": "需要定位用户指定的可预订房源",
                             },
                             "id": "find-two-booking-candidates",
                             "type": "tool_call",
@@ -567,7 +578,10 @@ class SpecialistAgentTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "find_cancellable_orders",
-                            "args": {"limit": 5},
+                            "args": {
+                                "limit": 5,
+                                "selection_reason": "需要查找当前用户可取消的订单",
+                            },
                             "id": "find-order",
                             "type": "tool_call",
                         }
@@ -578,7 +592,10 @@ class SpecialistAgentTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "cancel_order",
-                            "args": {"order_no": "cancel-order-1"},
+                            "args": {
+                                "order_no": "cancel-order-1",
+                                "selection_reason": "用户已指定需要取消的订单",
+                            },
                             "id": "cancel-order",
                             "type": "tool_call",
                         }
@@ -665,7 +682,10 @@ class SupervisorTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "delegate_to_order_history",
-                            "args": {"task": "查询当前用户的历史订单"},
+                            "args": {
+                                "task": "查询当前用户的历史订单",
+                                "selection_reason": "用户要求查看自己的历史订单",
+                            },
                             "id": "handoff-history",
                             "type": "tool_call",
                         }
@@ -701,6 +721,7 @@ class SupervisorTests(unittest.TestCase):
                 {
                     "agent": "order_history_agent",
                     "task": "查询当前用户的历史订单",
+                    "selection_reason": "用户要求查看自己的历史订单",
                     "tool_call_id": "handoff-history",
                     "result": {
                         "agent": "order_history_agent",
@@ -715,8 +736,23 @@ class SupervisorTests(unittest.TestCase):
         )
         self.assertNotIn("delegation_count", state)
         self.assertNotIn("delegated_agents", state)
+        handoff_message = next(
+            message
+            for message in state["messages"]
+            if getattr(message, "tool_call_id", None) == "handoff-history"
+        )
+        self.assertEqual(
+            json.loads(handoff_message.content)["selection_reason"],
+            "用户要求查看自己的历史订单",
+        )
         self.assertTrue(
             any("历史订单结果" in str(message.content) for message in supervisor_model.seen_messages)
+        )
+        self.assertTrue(
+            any(
+                "用户要求查看自己的历史订单" in str(message.content)
+                for message in supervisor_model.seen_messages
+            )
         )
         self.assertFalse(
             any("内部消息" in str(message.content) for message in supervisor_model.seen_messages)
@@ -743,7 +779,10 @@ class SupervisorTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "delegate_to_general_qa",
-                            "args": {"task": "查询天气"},
+                            "args": {
+                                "task": "查询天气",
+                                "selection_reason": "实时天气需要常规问答 Agent 联网查询",
+                            },
                             "id": "handoff-budget-fallback",
                             "type": "tool_call",
                         }
@@ -831,7 +870,10 @@ class SupervisorTests(unittest.TestCase):
                 tool_calls=[
                     {
                         "name": tool_name,
-                        "args": {"task": task},
+                        "args": {
+                            "task": task,
+                            "selection_reason": f"该任务适合委派给 {tool_name}",
+                        },
                         "id": call_id,
                         "type": "tool_call",
                     }
@@ -883,7 +925,10 @@ class SupervisorTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "delegate_to_order_history",
-                            "args": {"task": "第一次查询订单"},
+                            "args": {
+                                "task": "第一次查询订单",
+                                "selection_reason": "用户要求查询历史订单",
+                            },
                             "id": "repeat-first",
                             "type": "tool_call",
                         }
@@ -894,7 +939,10 @@ class SupervisorTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "delegate_to_order_history",
-                            "args": {"task": "再次查询相同订单"},
+                            "args": {
+                                "task": "再次查询相同订单",
+                                "selection_reason": "尝试重复查询相同订单",
+                            },
                             "id": "repeat-second",
                             "type": "tool_call",
                         }
@@ -931,6 +979,11 @@ class SupervisorTests(unittest.TestCase):
             if getattr(message, "tool_call_id", None) == "repeat-second"
         )
         self.assertIn("已经委派过", denial.content)
+        self.assertEqual(json.loads(denial.content)["status"], "rejected")
+        self.assertEqual(
+            json.loads(denial.content)["selection_reason"],
+            "尝试重复查询相同订单",
+        )
 
     def test_supervisor_resume_returns_to_interrupted_specialist(self) -> None:
         db = FakeBookingDB()
@@ -941,7 +994,10 @@ class SupervisorTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "delegate_to_rental_booking",
-                            "args": {"task": "预订测试公寓并补齐缺失信息"},
+                            "args": {
+                                "task": "预订测试公寓并补齐缺失信息",
+                                "selection_reason": "用户要求创建租房预订",
+                            },
                             "id": "handoff-booking",
                             "type": "tool_call",
                         }
@@ -959,7 +1015,7 @@ class SupervisorTests(unittest.TestCase):
                             "name": "request_user_input",
                             "args": {
                                 "question": "请补充手机号",
-                                "reason": "缺少预订信息",
+                                "selection_reason": "缺少预订所需手机号",
                                 "missing_fields": ["phone"],
                             },
                             "id": "nested-ask",
@@ -977,6 +1033,7 @@ class SupervisorTests(unittest.TestCase):
                                 "house_id": 1,
                                 "check_in_date": "2027-09-01",
                                 "check_out_date": "2027-09-02",
+                                "selection_reason": "信息齐全，可以创建预订",
                             },
                             "id": "nested-create",
                             "type": "tool_call",

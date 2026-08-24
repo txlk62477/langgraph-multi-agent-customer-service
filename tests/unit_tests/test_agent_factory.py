@@ -1,5 +1,6 @@
 """专业 Agent 统一构造与上下文中间件测试。"""
 
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -19,7 +20,9 @@ from agent.agents.specialist_budget import (
     SpecialistBudgetMiddleware,
     SpecialistBudgetPolicy,
 )
+from agent.agents.tool_selection_reason import ToolSelectionReasonMiddleware
 from agent.state.customer_service import SpecialistResult
+from agent.tools.runtime import SelectionReason
 
 
 class BudgetScriptModel(BaseChatModel):
@@ -63,10 +66,11 @@ class BudgetScriptModel(BaseChatModel):
 
 
 @tool
-def inspect_source(query: str) -> str:
+def inspect_source(query: str, selection_reason: SelectionReason) -> str:
     """读取一个测试来源。"""
 
-    return f"evidence:{query}"
+    del selection_reason
+    return json.dumps({"status": "success", "evidence": query})
 
 
 class SpecialistAgentFactoryTests(unittest.TestCase):
@@ -102,10 +106,11 @@ class SpecialistAgentFactoryTests(unittest.TestCase):
 
         self.assertIs(result, compiled)
         middleware = create.call_args.kwargs["middleware"]
-        self.assertEqual(len(middleware), 3)
+        self.assertEqual(len(middleware), 4)
         self.assertIsInstance(middleware[0], ContextEditingMiddleware)
         self.assertIsInstance(middleware[1], SummarizationMiddleware)
-        self.assertIsInstance(middleware[2], SpecialistBudgetMiddleware)
+        self.assertIsInstance(middleware[2], ToolSelectionReasonMiddleware)
+        self.assertIsInstance(middleware[3], SpecialistBudgetMiddleware)
         edit = middleware[0].edits[0]
         self.assertEqual(edit.trigger, 8_000)
         self.assertEqual(edit.clear_at_least, 2_000)
@@ -133,7 +138,8 @@ class SpecialistAgentFactoryTests(unittest.TestCase):
 
         middleware = create.call_args.kwargs["middleware"]
         self.assertEqual(middleware[0], custom)
-        self.assertIsInstance(middleware[1], SpecialistBudgetMiddleware)
+        self.assertIsInstance(middleware[1], ToolSelectionReasonMiddleware)
+        self.assertIsInstance(middleware[2], SpecialistBudgetMiddleware)
 
     def test_business_tool_limit_leaves_only_specialist_result_for_final_call(self) -> None:
         model = BudgetScriptModel(
@@ -143,7 +149,10 @@ class SpecialistAgentFactoryTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "inspect_source",
-                            "args": {"query": "first"},
+                            "args": {
+                                "query": "first",
+                                "selection_reason": "需要读取第一个测试来源",
+                            },
                             "id": "source-1",
                             "type": "tool_call",
                         }
@@ -191,6 +200,145 @@ class SpecialistAgentFactoryTests(unittest.TestCase):
         self.assertEqual(result["specialist_budget"]["business_tool_calls"], 1)
         self.assertTrue(result["specialist_budget"]["final_attempt"])
 
+    def test_tool_message_echoes_the_model_selection_reason(self) -> None:
+        model = BudgetScriptModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "inspect_source",
+                            "args": {
+                                "query": "candidate",
+                                "selection_reason": "候选来源可能包含所需事实",
+                            },
+                            "id": "source-with-reason",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "SpecialistResult",
+                            "args": {
+                                "agent": "general_qa_agent",
+                                "status": "success",
+                                "summary": "读取完成",
+                                "user_facing_answer": "已完成。",
+                                "completed_tasks": ["读取来源"],
+                                "remaining_tasks": [],
+                            },
+                            "id": "reason-result",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+            ]
+        )
+        graph = build_specialist_agent(
+            name="reason-agent",
+            specialist_name="general_qa_agent",
+            system_prompt="测试提示词",
+            tools=[inspect_source],
+            model_factory=lambda: model,
+            middleware=[],
+            budget_policy=SpecialistBudgetPolicy(
+                business_tool_calls=2,
+                model_calls=12,
+            ),
+        )
+
+        result = graph.invoke({"messages": [HumanMessage(content="查询候选来源")]})
+
+        tool_message = next(
+            message
+            for message in result["messages"]
+            if getattr(message, "tool_call_id", None) == "source-with-reason"
+        )
+        payload = json.loads(tool_message.content)
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(
+            payload["selection_reason"],
+            "候选来源可能包含所需事实",
+        )
+
+    def test_budget_blocked_tool_message_keeps_its_selection_reason(self) -> None:
+        model = BudgetScriptModel(
+            [
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "inspect_source",
+                            "args": {
+                                "query": "allowed",
+                                "selection_reason": "读取预算内来源",
+                            },
+                            "id": "allowed-source",
+                            "type": "tool_call",
+                        },
+                        {
+                            "name": "inspect_source",
+                            "args": {
+                                "query": "blocked",
+                                "selection_reason": "尝试读取超出预算的补充来源",
+                            },
+                            "id": "blocked-source",
+                            "type": "tool_call",
+                        },
+                    ],
+                ),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "SpecialistResult",
+                            "args": {
+                                "agent": "general_qa_agent",
+                                "status": "success",
+                                "summary": "预算内来源足够",
+                                "user_facing_answer": "已完成。",
+                                "completed_tasks": ["读取来源"],
+                                "remaining_tasks": [],
+                            },
+                            "id": "budget-result",
+                            "type": "tool_call",
+                        }
+                    ],
+                ),
+            ]
+        )
+        graph = build_specialist_agent(
+            name="blocked-reason-agent",
+            specialist_name="general_qa_agent",
+            system_prompt="测试提示词",
+            tools=[inspect_source],
+            model_factory=lambda: model,
+            middleware=[],
+            budget_policy=SpecialistBudgetPolicy(
+                business_tool_calls=1,
+                model_calls=12,
+            ),
+        )
+
+        result = graph.invoke({"messages": [HumanMessage(content="读取两个来源")]})
+
+        blocked_message = next(
+            message
+            for message in result["messages"]
+            if getattr(message, "tool_call_id", None) == "blocked-source"
+        )
+        self.assertEqual(
+            json.loads(blocked_message.content),
+            {
+                "status": "limit_reached",
+                "selection_reason": "尝试读取超出预算的补充来源",
+                "error": "专业 Agent 已达到业务工具调用上限，本次调用未执行。",
+            },
+        )
+
     def test_final_attempt_falls_back_when_model_ignores_specialist_result(self) -> None:
         model = BudgetScriptModel(
             [
@@ -199,7 +347,10 @@ class SpecialistAgentFactoryTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "inspect_source",
-                            "args": {"query": "first"},
+                            "args": {
+                                "query": "first",
+                                "selection_reason": "需要读取第一个测试来源",
+                            },
                             "id": "source-1",
                             "type": "tool_call",
                         }
@@ -239,7 +390,10 @@ class SpecialistAgentFactoryTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "inspect_source",
-                            "args": {"query": "first"},
+                            "args": {
+                                "query": "first",
+                                "selection_reason": "需要读取第一个测试来源",
+                            },
                             "id": "source-1",
                             "type": "tool_call",
                         }
@@ -250,7 +404,10 @@ class SpecialistAgentFactoryTests(unittest.TestCase):
                     tool_calls=[
                         {
                             "name": "inspect_source",
-                            "args": {"query": "second"},
+                            "args": {
+                                "query": "second",
+                                "selection_reason": "第一个来源不足，需要补充证据",
+                            },
                             "id": "source-2",
                             "type": "tool_call",
                         }

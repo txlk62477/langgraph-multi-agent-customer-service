@@ -53,6 +53,7 @@ class DelegationRecord(TypedDict):
 
     agent: SpecialistName
     task: str
+    selection_reason: str
     tool_call_id: str
     result: NotRequired[SpecialistResult]
 

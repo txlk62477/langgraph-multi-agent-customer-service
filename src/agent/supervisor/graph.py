@@ -16,6 +16,7 @@ from agent.agents.order_cancellation import build_order_cancellation_agent
 from agent.agents.order_history import build_order_history_agent
 from agent.agents.rental_booking import build_rental_booking_agent
 from agent.agents.rental_recommendation import build_rental_recommendation_agent
+from agent.agents.tool_selection_reason import ToolSelectionReasonMiddleware
 from agent.common.booking_db import BookingDB, PostgresBookingDB
 from agent.common.llm import build_chat_model
 from agent.node.preferences import PreferenceUpdateNode, load_preferences
@@ -42,7 +43,8 @@ Agent，并把专业结果整理成一条完整、准确的最终回复。
 2. 任何知识查询或具体租房业务都必须委派给职责匹配的专业 Agent；你不能自行猜测
    事实、查询数据库或代替专业 Agent 执行业务。
 3. 每次只能调用一个 delegate_to_* 工具。task 参数必须写成完整、明确、可执行的任务，
-   并保留用户给出的关键条件。不要只复制一句模糊原话。
+   并保留用户给出的关键条件。selection_reason 必须用一句不超过100字的中文说明为什么
+   该专业 Agent 最适合当前任务；不得写详细推理。不要只复制一句模糊原话。
 4. 专业 Agent 完成后会把结果放回共享对话。你要判断用户是否还有未完成的独立目标；
    如有可继续委派，否则综合已有结果回答用户。
 5. 单轮最多委派 {MAX_DELEGATIONS} 次，同一个专业 Agent 不得重复委派。不要为了验证
@@ -111,6 +113,7 @@ def build_customer_service_graph(
             SupervisorContextProjectionMiddleware(
                 supervisor_name=supervisor_name,
             ),
+            ToolSelectionReasonMiddleware(),
             *build_context_middleware(supervisor_model),
         ],
         state_schema=CustomerServiceState,

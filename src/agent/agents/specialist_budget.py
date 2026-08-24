@@ -18,6 +18,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
 
 from agent.state.customer_service import SpecialistName, SpecialistResult
+from agent.tools.runtime import json_result
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,7 +187,16 @@ class SpecialistBudgetMiddleware(AgentMiddleware[SpecialistBudgetState, Any, Spe
                 message.model_copy(update={"tool_calls": kept_calls}),
                 *[
                     ToolMessage(
-                        content="专业 Agent 已达到业务工具调用上限，本次调用未执行。",
+                        content=json_result(
+                            status="limit_reached",
+                            selection_reason=str(
+                                call.get("args", {}).get("selection_reason", "")
+                            ).strip(),
+                            error=(
+                                "专业 Agent 已达到业务工具调用上限，"
+                                "本次调用未执行。"
+                            ),
+                        ),
                         tool_call_id=str(call.get("id", "")),
                         name=str(call.get("name", "")),
                         status="error",

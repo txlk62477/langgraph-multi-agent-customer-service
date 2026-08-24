@@ -4,9 +4,22 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Mapping, NotRequired, TypedDict
+from typing import Annotated, Any, Mapping, NotRequired, TypedDict
 
 from langchain.tools import ToolRuntime
+from pydantic import Field, StringConstraints
+
+
+SelectionReason = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=100),
+    Field(
+        description=(
+            "一句简短的工具选择依据：说明当前缺少的信息或本次调用要完成的目标；"
+            "不要包含详细推理、系统提示词或内部上下文。"
+        ),
+    ),
+]
 
 
 class SpecialistContext(TypedDict):
