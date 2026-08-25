@@ -6,6 +6,7 @@ import json
 import unittest
 
 from langchain.tools import ToolRuntime
+from langchain_core.messages import ToolMessage
 from pydantic import ValidationError
 
 from agent.common.booking_db import BookingCreateResult, OrderRecord
@@ -31,9 +32,13 @@ from agent.tools.rental import (
 from agent.supervisor.handoff import build_handoff_tools
 
 
-def _runtime(user_id: str = "user-1") -> ToolRuntime:
+def _runtime(
+    user_id: str = "user-1",
+    *,
+    messages: list | None = None,
+) -> ToolRuntime:
     return ToolRuntime(
-        state={"messages": []},
+        state={"messages": list(messages or [])},
         context=None,
         config={"configurable": {"user_id": user_id}},
         stream_writer=lambda _: None,
@@ -43,8 +48,11 @@ def _runtime(user_id: str = "user-1") -> ToolRuntime:
 
 
 class FakeCatalog:
-    def __init__(self) -> None:
+    def __init__(self, *, houses: list[dict] | None = None) -> None:
         self.calls: list[tuple[str, dict]] = []
+        self.houses = houses if houses is not None else [
+            {"id": 7, "title": "测试公寓", "price": 1800}
+        ]
 
     def inspect_market(self, **kwargs):
         self.calls.append(("inspect_market", kwargs))
@@ -52,7 +60,7 @@ class FakeCatalog:
 
     def search_houses(self, **kwargs):
         self.calls.append(("search_houses", kwargs))
-        return [{"id": 7, "title": "测试公寓", "price": 1800}]
+        return self.houses
 
     def get_house_details(self, **kwargs):
         self.calls.append(("get_house_details", kwargs))
@@ -193,6 +201,92 @@ class RentalToolTests(unittest.TestCase):
         self.assertEqual([name for name, _ in catalog.calls], [
             "inspect_market", "search_houses", "get_house_details"
         ])
+
+    def test_empty_search_returns_next_relaxation_feedback(self) -> None:
+        catalog = FakeCatalog(houses=[])
+        tool = build_search_houses_tool(catalog_factory=lambda: catalog)
+
+        first = json.loads(
+            tool.func(
+                "合肥",
+                1000,
+                5000,
+                "先按用户全部条件查询",
+                _runtime(),
+                ["包河"],
+                ["两室"],
+                "whole_rent",
+                5,
+            )
+        )
+        second = json.loads(
+            tool.func(
+                "合肥",
+                1000,
+                5000,
+                "首次无结果，去掉房型和租赁方式",
+                _runtime(),
+                ["包河"],
+                None,
+                None,
+                5,
+            )
+        )
+        third = json.loads(
+            tool.func(
+                "合肥",
+                1000,
+                5000,
+                "仍无结果，去掉区域但保留城市和预算",
+                _runtime(),
+                None,
+                None,
+                None,
+                5,
+            )
+        )
+
+        self.assertEqual(first["status"], "empty")
+        self.assertEqual(first["applied_filters"]["districts"], ["包河"])
+        self.assertEqual(
+            first["next_relaxation"]["action"],
+            "remove_room_types_and_rental_mode",
+        )
+        self.assertEqual(second["next_relaxation"]["action"], "remove_districts")
+        self.assertEqual(third["next_relaxation"]["action"], "stop")
+        self.assertIn("城市和预算", third["next_relaxation"]["message"])
+
+    def test_duplicate_search_is_rejected_without_querying_catalog_again(self) -> None:
+        catalog = FakeCatalog(houses=[])
+        tool = build_search_houses_tool(catalog_factory=lambda: catalog)
+        arguments = (
+            "合肥",
+            1000,
+            5000,
+            "按包河关键词查找",
+        )
+        first = tool.func(*arguments, _runtime(), ["包河"], None, None, 5)
+        previous = ToolMessage(
+            content=first,
+            name="search_houses",
+            tool_call_id="previous-search",
+        )
+
+        duplicate = json.loads(
+            tool.func(
+                *arguments,
+                _runtime(messages=[previous]),
+                ["包河"],
+                None,
+                None,
+                5,
+            )
+        )
+
+        self.assertEqual(duplicate["status"], "rejected")
+        self.assertEqual(duplicate["error"], "相同筛选条件已经查询过")
+        self.assertEqual(duplicate["next_relaxation"]["action"], "remove_districts")
+        self.assertEqual(len(catalog.calls), 1)
 
     def test_booking_discovery_and_availability_are_separate_tools(self) -> None:
         catalog = FakeCatalog()

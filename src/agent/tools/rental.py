@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date
+import json
 import re
+from typing import Any
 
 from langchain.tools import ToolRuntime, tool
+from langchain_core.messages import ToolMessage
 
 from agent.common.booking_db import BookingDB, PostgresBookingDB
 from agent.common.preferences import PREFERENCE_STORE_KEY, PreferenceProfile, preference_namespace
@@ -91,25 +94,68 @@ def build_search_houses_tool(
     ) -> str:
         """按城市和预算查询房源，可附加区域、房型和租赁方式条件。"""
 
-        del runtime, selection_reason
+        del selection_reason
         cleaned_city = city.strip()
         if not cleaned_city:
             return json_result(status="invalid", houses=[], error="城市不能为空")
         if budget_min < 0 or budget_max < 0 or budget_min > budget_max:
             return json_result(status="invalid", houses=[], error="租金预算范围无效")
+        cleaned_districts = _clean_list(districts)
+        cleaned_room_types = _clean_list(room_types)
+        cleaned_rental_mode = (rental_mode or "").strip() or None
+        cleaned_max_results = max(1, min(int(max_results), 10))
+        applied_filters = {
+            "city": cleaned_city,
+            "budget_min": budget_min,
+            "budget_max": budget_max,
+            "districts": cleaned_districts,
+            "room_types": cleaned_room_types,
+            "rental_mode": cleaned_rental_mode,
+            "max_results": cleaned_max_results,
+        }
+        next_relaxation = _next_search_relaxation(
+            districts=cleaned_districts,
+            room_types=cleaned_room_types,
+            rental_mode=cleaned_rental_mode,
+        )
+        if _search_was_already_attempted(runtime, applied_filters):
+            return json_result(
+                status="rejected",
+                houses=[],
+                applied_filters=applied_filters,
+                error="相同筛选条件已经查询过",
+                next_relaxation=next_relaxation,
+            )
         try:
             houses = catalog_factory().search_houses(
                 city=cleaned_city,
                 budget_min=budget_min,
                 budget_max=budget_max,
-                districts=_clean_list(districts),
-                room_types=_clean_list(room_types),
-                rental_mode=(rental_mode or "").strip() or None,
-                limit=max_results,
+                districts=cleaned_districts,
+                room_types=cleaned_room_types,
+                rental_mode=cleaned_rental_mode,
+                limit=cleaned_max_results,
             )
-            return json_result(status="success" if houses else "empty", houses=houses)
+            if houses:
+                return json_result(
+                    status="success",
+                    houses=houses,
+                    applied_filters=applied_filters,
+                )
+            return json_result(
+                status="empty",
+                houses=[],
+                applied_filters=applied_filters,
+                empty_reason="当前关键词和筛选条件未匹配到房源",
+                next_relaxation=next_relaxation,
+            )
         except Exception as error:
-            return json_result(status="failed", houses=[], error=_error(error))
+            return json_result(
+                status="failed",
+                houses=[],
+                applied_filters=applied_filters,
+                error=_error(error),
+            )
 
     return search_houses
 
@@ -238,6 +284,54 @@ def build_create_booking_tool(
 
 def _clean_list(values: list[str] | None) -> list[str]:
     return list(dict.fromkeys(value.strip() for value in values or [] if value.strip()))
+
+
+def _next_search_relaxation(
+    *,
+    districts: list[str],
+    room_types: list[str],
+    rental_mode: str | None,
+) -> dict[str, Any]:
+    """告诉 Agent 下一次只应放宽哪一层条件，城市和预算始终保留。"""
+
+    if room_types or rental_mode:
+        return {
+            "action": "remove_room_types_and_rental_mode",
+            "remove_filters": ["room_types", "rental_mode"],
+            "message": "去掉房型和租赁方式，保留城市、预算和区域后重新查询",
+        }
+    if districts:
+        return {
+            "action": "remove_districts",
+            "remove_filters": ["districts"],
+            "message": "去掉区域，保留城市和预算后查询其他区域房源",
+        }
+    return {
+        "action": "stop",
+        "remove_filters": [],
+        "message": "城市和预算条件下仍无结果，停止查询并如实告知用户",
+    }
+
+
+def _search_was_already_attempted(
+    runtime: ToolRuntime[SpecialistContext],
+    applied_filters: dict[str, Any],
+) -> bool:
+    """根据历史 ToolMessage 阻止 Agent 使用完全相同的条件重复查库。"""
+
+    state = runtime.state if isinstance(runtime.state, Mapping) else {}
+    for message in reversed(state.get("messages", [])):
+        if not isinstance(message, ToolMessage) or message.name != "search_houses":
+            continue
+        if not isinstance(message.content, str):
+            continue
+        try:
+            payload = json.loads(message.content)
+        except (TypeError, ValueError):
+            continue
+        if payload.get("applied_filters") == applied_filters:
+            return True
+    return False
 
 
 def _error(error: Exception) -> str:

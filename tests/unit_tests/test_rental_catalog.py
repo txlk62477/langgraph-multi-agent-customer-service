@@ -62,9 +62,32 @@ class RentalCatalogTests(unittest.TestCase):
 
         sql, params = connection.executed[0]
         self.assertNotIn("OR TRUE", sql)
-        self.assertEqual(params["city"], "上海' OR TRUE --")
-        self.assertEqual(params["districts"], ["浦东%"])
+        self.assertIn("city_name ILIKE %(city_pattern)s", sql)
+        self.assertIn("region_name ILIKE %(district_pattern_0)s", sql)
+        self.assertEqual(params["city_pattern"], "%上海' OR TRUE --%")
+        self.assertEqual(params["district_pattern_0"], "%浦东\\%%")
         self.assertEqual(houses[0]["price"], 1888.5)
+
+    def test_search_matches_city_and_district_by_escaped_keywords(self) -> None:
+        connection = FakeConnection([[]])
+
+        self._catalog(connection).search_houses(
+            city="合肥",
+            budget_min=1000,
+            budget_max=5000,
+            districts=["包河", "肥东_"],
+            room_types=[],
+            rental_mode=None,
+            limit=5,
+        )
+
+        sql, params = connection.executed[0]
+        self.assertIn("city_name ILIKE %(city_pattern)s", sql)
+        self.assertIn("region_name ILIKE %(district_pattern_0)s", sql)
+        self.assertIn("region_name ILIKE %(district_pattern_1)s", sql)
+        self.assertEqual(params["city_pattern"], "%合肥%")
+        self.assertEqual(params["district_pattern_0"], "%包河%")
+        self.assertEqual(params["district_pattern_1"], "%肥东\\_%")
 
     def test_find_houses_escapes_like_wildcards(self) -> None:
         connection = FakeConnection([[]])
@@ -81,9 +104,10 @@ class RentalCatalogTests(unittest.TestCase):
 
         sql, params = connection.executed[0]
         self.assertIn("SELECT city_name", sql)
+        self.assertIn("city_name ILIKE %(city_pattern)s", sql)
         self.assertNotIn("INSERT", sql)
         self.assertNotIn("UPDATE", sql)
-        self.assertEqual(params, {"city": "上海", "limit": 20})
+        self.assertEqual(params, {"city_pattern": "%上海%", "limit": 20})
 
 
 if __name__ == "__main__":

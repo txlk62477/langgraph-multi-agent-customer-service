@@ -110,6 +110,18 @@ PROGRESS_DESCRIPTIONS = {
     "request_user_input": "需要您补充信息或确认后才能继续。",
 }
 
+# create_agent 内部节点都叫 agent/model，必须结合 SSE 子图命名空间才能
+# 判断当前真正运行的是哪个专业 Agent。canonical name 同时作为前端步骤 ID，
+# 避免一轮中的多个专业 Agent 被通用节点名错误合并。
+SPECIALIST_PROGRESS_LABELS = {
+    "general_qa_agent": "一般问答 Agent 正在处理",
+    "rental_recommendation_agent": "房源推荐 Agent 正在处理",
+    "rental_booking_agent": "房源预订 Agent 正在处理",
+    "order_history_agent": "历史订单 Agent 正在处理",
+    "order_cancellation_agent": "订单取消 Agent 正在处理",
+}
+SPECIALIST_INTERNAL_NODES = frozenset({"agent", "model"})
+
 
 def _log(*parts: object) -> None:
     """图执行调试日志；DEBUG_GRAPH=0 时静默。"""
@@ -266,6 +278,16 @@ def _event_namespace(event_name: str) -> list[str]:
         for part in event_name.split("|")[1:]
         if part
     ]
+
+
+def _event_specialist(event_name: str) -> str | None:
+    """从嵌套事件路径中解析当前专业 Agent，排除 Supervisor 内部模型。"""
+
+    for component in reversed(_event_namespace(event_name)):
+        for specialist in SPECIALIST_PROGRESS_LABELS:
+            if component == specialist or component.endswith(f"_{specialist}"):
+                return specialist
+    return None
 
 
 def _message_text(message: object) -> str:
@@ -471,14 +493,27 @@ def _progress_detail(node: str, data: object) -> str:
     return PROGRESS_DESCRIPTIONS[node]
 
 
-def _progress_event(node: str, data: object, *, completed: bool) -> dict:
+def _progress_event(
+    node: str,
+    data: object,
+    *,
+    completed: bool,
+    specialist: str | None = None,
+) -> dict:
     """构造稳定的前端步骤协议，不传递原始节点输出。"""
 
+    is_specialist_step = node in SPECIALIST_INTERNAL_NODES and specialist is not None
+    label = (
+        SPECIALIST_PROGRESS_LABELS[specialist]
+        if is_specialist_step
+        else PROGRESS_LABELS[node]
+    )
     return {
         "type": "progress",
-        # 浏览器不需要知道 Python 节点名，中文标题同时作为更新键。
-        "step_id": PROGRESS_LABELS[node],
-        "title": PROGRESS_LABELS[node],
+        # 专业 Agent 使用 canonical name 区分同一轮的多次委派；普通业务节点
+        # 继续用中文标题作为更新键，浏览器不会看到 Python 工具节点名。
+        "step_id": specialist if is_specialist_step else label,
+        "title": label,
         # 节点开始时的 input 可能还带着上一步的旧值，因此
         # 运行中只显示固定说明；完成后才显示节点的新参数。
         "detail": (
@@ -549,6 +584,7 @@ def iter_chat_events(message: str, thread_id: str | None) -> Iterator[dict]:
             continue
 
         if kind == "tasks":
+            specialist = _event_specialist(event_name)
             tasks = data if isinstance(data, list) else [data]
             for task in tasks:
                 if not isinstance(task, dict):
@@ -556,12 +592,18 @@ def iter_chat_events(message: str, thread_id: str | None) -> Iterator[dict]:
                 node = task.get("name")
                 # tasks 同时包含开始和完成事件。完成事件的 result 是节点真实
                 # 返回值，不受图公共输出 Schema 对 updates 的过滤。
-                if (
+                is_internal_agent_node = node in SPECIALIST_INTERNAL_NODES
+                progress_enabled = (
                     node in PROGRESS_LABELS
+                    and (not is_internal_agent_node or specialist is not None)
+                )
+                progress_key = specialist if is_internal_agent_node else node
+                if (
+                    progress_enabled
                     and "input" in task
-                    and node not in started_progress
+                    and progress_key not in started_progress
                 ):
-                    started_progress.add(node)
+                    started_progress.add(progress_key)
                     task_input = task.get("input")
                     if isinstance(task_input, dict):
                         progress_inputs[node] = task_input
@@ -569,13 +611,14 @@ def iter_chat_events(message: str, thread_id: str | None) -> Iterator[dict]:
                         node,
                         task_input,
                         completed=False,
+                        specialist=specialist,
                     )
                 if (
-                    node in PROGRESS_LABELS
+                    progress_enabled
                     and "result" in task
-                    and node not in completed_progress
+                    and progress_key not in completed_progress
                 ):
-                    completed_progress.add(node)
+                    completed_progress.add(progress_key)
                     task_result = task.get("result")
                     input_data = progress_inputs.get(node, {})
                     if isinstance(task_result, dict):
@@ -586,6 +629,7 @@ def iter_chat_events(message: str, thread_id: str | None) -> Iterator[dict]:
                         node,
                         progress_data,
                         completed=True,
+                        specialist=specialist,
                     )
             continue
 

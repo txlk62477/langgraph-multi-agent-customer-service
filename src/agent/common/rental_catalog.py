@@ -67,10 +67,14 @@ class PostgresRentalCatalog:
         city: str | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        clause = "WHERE city_name = %(city)s" if city else ""
+        clause = (
+            "WHERE city_name ILIKE %(city_pattern)s ESCAPE '\\'"
+            if city
+            else ""
+        )
         params: dict[str, Any] = {"limit": _limit(limit, maximum=20)}
         if city:
-            params["city"] = city.strip()
+            params["city_pattern"] = f"%{_escape_like(city.strip())}%"
         sql = f"""
             SELECT city_name, region_name, COUNT(*) AS house_count,
                    MIN(price) AS price_min, MAX(price) AS price_max
@@ -94,18 +98,24 @@ class PostgresRentalCatalog:
         limit: int,
     ) -> list[dict[str, Any]]:
         clauses = [
-            "city_name = %(city)s",
+            "city_name ILIKE %(city_pattern)s ESCAPE '\\'",
             "price BETWEEN %(budget_min)s AND %(budget_max)s",
         ]
         params: dict[str, Any] = {
-            "city": city.strip(),
+            "city_pattern": f"%{_escape_like(city.strip())}%",
             "budget_min": budget_min,
             "budget_max": budget_max,
             "limit": _limit(limit, maximum=10),
         }
         if districts:
-            clauses.append("region_name = ANY(%(districts)s)")
-            params["districts"] = list(districts)
+            district_clauses: list[str] = []
+            for index, district in enumerate(districts):
+                parameter = f"district_pattern_{index}"
+                district_clauses.append(
+                    f"region_name ILIKE %({parameter})s ESCAPE '\\'"
+                )
+                params[parameter] = f"%{_escape_like(district.strip())}%"
+            clauses.append(f"({' OR '.join(district_clauses)})")
         if room_types:
             clauses.append(
                 "(house_type = ANY(%(room_types)s) "

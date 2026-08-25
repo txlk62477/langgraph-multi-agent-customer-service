@@ -140,6 +140,54 @@ class WebChatStreamTests(unittest.TestCase):
         self.assertNotIn("search_houses", str(progress))
         self.assertNotIn("SELECT", str(progress))
 
+    def test_each_specialist_uses_its_own_progress_title(self) -> None:
+        """同一轮连续委派时，每个专业 Agent 都应显示独立中文名称。"""
+
+        initial = {"values": {"messages": []}, "interrupts": []}
+        final = {"values": {"messages": [{"type": "ai", "content": "完成"}]}, "interrupts": []}
+        agent_events = (
+            ("tasks|rental_recommendation_agent:1", {
+                "name": "model",
+                "input": {},
+            }),
+            ("tasks|rental_recommendation_agent:1", {
+                "name": "model",
+                "result": {},
+            }),
+            ("tasks|rental_booking_agent:2", {
+                "name": "model",
+                "input": {},
+            }),
+            ("tasks|rental_booking_agent:2", {
+                "name": "model",
+                "result": {},
+            }),
+            ("tasks|supervisor_agent:3", {
+                "name": "model",
+                "input": {},
+            }),
+        )
+        with (
+            patch.object(app, "get_json", side_effect=[initial, final]),
+            patch.object(app, "_iter_agent_events", return_value=iter(agent_events)),
+        ):
+            events = list(app.iter_chat_events("推荐并预订房源", "thread-1"))
+
+        progress = [event for event in events if event["type"] == "progress"]
+        self.assertEqual(
+            [event["title"] for event in progress],
+            [
+                "房源推荐 Agent 正在处理",
+                "房源推荐 Agent 正在处理",
+                "房源预订 Agent 正在处理",
+                "房源预订 Agent 正在处理",
+            ],
+        )
+        self.assertEqual(
+            {event["step_id"] for event in progress},
+            {"rental_recommendation_agent", "rental_booking_agent"},
+        )
+
     def test_preference_progress_contains_only_safe_business_parameters(self) -> None:
         """偏好步骤可显示城市预算，但不传递用户 ID 和原始状态。"""
 
