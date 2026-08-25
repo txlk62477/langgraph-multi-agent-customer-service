@@ -455,3 +455,15 @@ async def read_search_results(
             }
             for result in results
         ]
+
+
+def read_search_results_sync(
+    results: list[dict[str, Any]],
+    *,
+    max_concurrency: int = MAX_CONCURRENCY,
+) -> list[dict[str, Any]]:
+    """同步调用批量浏览器读取，供同步 LangChain 工具入口使用。"""
+
+    return asyncio.run(
+        read_search_results(results, max_concurrency=max_concurrency)
+    )

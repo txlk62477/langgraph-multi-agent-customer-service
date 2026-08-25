@@ -5,19 +5,25 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 import json
 import re
-from typing import Any
+from typing import Annotated, Any
 
 from langchain.tools import ToolRuntime, tool
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from pydantic import Field
 
 from agent.common.anysearch import search_anysearch
-from agent.common.browser_reader import read_search_result_sync
+from agent.common.browser_reader import (
+    MAX_CONCURRENCY,
+    read_search_result_sync,
+    read_search_results_sync,
+)
 from agent.common.vision import OllamaVisionClient, get_vision_client
 from agent.tools.runtime import SelectionReason, SpecialistContext, json_result
 
 
 ANYSEARCH_CALL_LIMIT = 3
 PLAYWRIGHT_CALL_LIMIT = 4
+PLAYWRIGHT_BATCH_LIMIT = 4
 VISION_CALL_LIMIT = 2
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = ".,;:!?，。；：！？、）)]}"
@@ -29,7 +35,16 @@ _ACCESS_CHALLENGE_PATTERN = re.compile(
 
 Search = Callable[..., list[dict[str, Any]]]
 PageReader = Callable[..., dict[str, Any]]
+PagesReader = Callable[..., list[dict[str, Any]]]
 VisionFactory = Callable[[], OllamaVisionClient]
+PageUrls = Annotated[
+    list[str],
+    Field(
+        min_length=1,
+        max_length=PLAYWRIGHT_BATCH_LIMIT,
+        description="本次需要读取的1到4个已批准网页URL，多个来源应合并在一次调用中",
+    ),
+]
 
 
 def _messages(runtime: ToolRuntime[SpecialistContext]) -> Sequence[Any]:
@@ -209,17 +224,17 @@ def build_anysearch_search_tool(*, search: Search = search_anysearch):
 
 def build_playwright_read_page_tool(
     *,
-    page_reader: PageReader = read_search_result_sync,
+    pages_reader: PagesReader = read_search_results_sync,
 ):
-    """创建由 Agent 按需选择 URL 的动态网页文本读取工具。"""
+    """创建由 Agent 一次选择多个 URL 的动态网页文本读取工具。"""
 
     @tool("playwright_read_page")
     def playwright_read_page(
-        url: str,
+        urls: PageUrls,
         selection_reason: SelectionReason,
         runtime: ToolRuntime[SpecialistContext],
     ) -> str:
-        """读取已批准URL的渲染正文和JSON响应；不进行视觉分析。"""
+        """批量读取已批准URL的渲染正文和JSON响应；不进行视觉分析。"""
 
         del selection_reason
         if _budget_reached(runtime, "playwright_read_page", PLAYWRIGHT_CALL_LIMIT):
@@ -227,35 +242,101 @@ def build_playwright_read_page_tool(
                 status="limit_reached",
                 error=f"本轮网页读取次数已达到上限{PLAYWRIGHT_CALL_LIMIT}",
             )
-        rejected = _reject_unapproved_url(url, runtime)
-        if rejected is not None:
-            return rejected
-        cleaned = url.strip()
+        # 先标准化并按首次出现顺序去重，避免同一页面重复占用浏览器和模型上下文。
+        cleaned_urls = list(dict.fromkeys(url.strip() for url in urls))
+        if not cleaned_urls:
+            return json_result(status="failed", pages=[], error="URL列表不能为空")
+        if len(cleaned_urls) > PLAYWRIGHT_BATCH_LIMIT:
+            return json_result(
+                status="failed",
+                pages=[],
+                error=f"单次最多{PLAYWRIGHT_BATCH_LIMIT}个不同URL",
+            )
+
+        # 逐项预留输出位置，只把用户明确提供或本轮搜索返回的URL送入浏览器。
+        # 未授权项留在原位置返回 rejected，不影响同批其他合法页面。
+        approved_urls = _approved_urls(runtime)
+        pages: list[dict[str, Any] | None] = []
+        readable_urls: list[str] = []
+        readable_indexes: list[int] = []
+        for url in cleaned_urls:
+            if not url:
+                pages.append(
+                    {"status": "rejected", "url": url, "error": "URL不能为空"}
+                )
+                continue
+            if url not in approved_urls:
+                pages.append(
+                    {
+                        "status": "rejected",
+                        "url": url,
+                        "error": (
+                            "只能访问本轮AnySearch返回或用户明确提供的URL；"
+                            "请先搜索来源"
+                        ),
+                    }
+                )
+                continue
+            readable_indexes.append(len(pages))
+            readable_urls.append(url)
+            pages.append(None)
         try:
-            result = page_reader(
-                {"title": "", "url": cleaned},
-                capture_screenshot=False,
+            # 底层一次启动一个Chromium，并在独立Context中并发读取合法页面。
+            results = (
+                pages_reader(
+                    [{"title": "", "url": url} for url in readable_urls],
+                    max_concurrency=MAX_CONCURRENCY,
+                )
+                if readable_urls
+                else []
             )
         except Exception as error:
             return json_result(
                 status="failed",
-                url=cleaned,
+                pages=[],
                 error=f"{type(error).__name__}: {error}",
             )
-        error = str(result.get("browser_error", ""))
-        rendered_text = str(result.get("rendered_text", ""))
-        title = str(result.get("title", ""))
-        http_status, access_error = _page_access_error(result)
-        error = error or access_error
-        success = not access_error
+        # 将浏览器结果填回预留位置，保证最终pages顺序与去重后的输入一致。
+        for result_index, (index, url) in enumerate(
+            zip(readable_indexes, readable_urls, strict=True)
+        ):
+            if result_index >= len(results):
+                pages[index] = {
+                    "status": "failed",
+                    "title": "",
+                    "url": url,
+                    "http_status": None,
+                    "rendered_text": "",
+                    "json_responses": [],
+                    "error": "批量网页读取器未返回该URL的结果",
+                }
+                continue
+            result = results[result_index]
+            http_status, access_error = _page_access_error(result)
+            pages[index] = {
+                "status": "success" if not access_error else "failed",
+                "title": str(result.get("title", "")),
+                "url": url,
+                "http_status": http_status,
+                "rendered_text": (
+                    str(result.get("rendered_text", ""))
+                    if not access_error
+                    else ""
+                ),
+                "json_responses": result.get("json_responses", []),
+                "error": str(result.get("browser_error", "")) or access_error,
+            }
+        resolved_pages = [page for page in pages if page is not None]
+        success_count = sum(
+            page["status"] == "success" for page in resolved_pages
+        )
         return json_result(
-            status="success" if success else "failed",
-            title=title,
-            url=cleaned,
-            http_status=http_status,
-            rendered_text=rendered_text if success else "",
-            json_responses=result.get("json_responses", []),
-            error=error,
+            status=(
+                "success"
+                if success_count == len(resolved_pages)
+                else "partial_success" if success_count else "failed"
+            ),
+            pages=resolved_pages,
         )
 
     return playwright_read_page

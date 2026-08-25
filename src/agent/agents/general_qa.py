@@ -30,7 +30,8 @@ GENERAL_QA_PROMPT = """你是智能客服中的常规问答研究 Agent。你的
 
 - anysearch_search：只获取标题、URL和摘要。摘要足以支持简单结论时可以直接使用；摘要
   缺少关键细节、日期、上下文或原文依据时，再选择值得信任的URL继续读取。
-- playwright_read_page：读取JavaScript渲染后的正文和JSON响应。不要打开所有搜索结果；
+- playwright_read_page：一次读取1到4个URL的JavaScript渲染正文和JSON响应。需要读取多个
+  来源时，必须把URL合并到一次工具调用，不要为每个URL分别调用。不要打开所有搜索结果；
   优先选择官方、原始发布者、权威机构或最接近事实源头的页面。
 - analyze_page_visuals：仅在关键信息存在于图表、Canvas、图片、仪表盘、可视价格或状态
   面板中，而文本和JSON不足时使用。普通文章正文不要浪费视觉调用。
@@ -39,7 +40,7 @@ GENERAL_QA_PROMPT = """你是智能客服中的常规问答研究 Agent。你的
 ## 调查预算与停止条件
 
 - anysearch_search 每轮最多调用3次。
-- playwright_read_page 每轮最多读取4个网页。
+- playwright_read_page 单次最多读取4个网页；已有候选来源时优先批量读取，避免重复调用。
 - analyze_page_visuals 每轮最多分析2个网页。
 - 已有证据足以回答时立即停止，不要为了用满额度继续调用工具。
 - 达到上限仍没有可靠证据时，明确说明暂时无法确认，不得继续尝试或猜测。

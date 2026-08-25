@@ -12,7 +12,6 @@ from langchain.agents.middleware.types import (
     AgentState,
     ModelRequest,
     ModelResponse,
-    hook_config,
 )
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
@@ -86,7 +85,6 @@ class SpecialistBudgetMiddleware(AgentMiddleware[SpecialistBudgetState, Any, Spe
             return None
         return {"specialist_budget": _new_snapshot(owner_key, self.agent)}
 
-    @hook_config(can_jump_to=["end"])
     def before_model(
         self,
         state: SpecialistBudgetState,
